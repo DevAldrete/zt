@@ -214,6 +214,9 @@ pub const Term = struct {
     sync_update: bool = false,
     has_truecolor_cells: bool = false,
     has_wide_chars: bool = false,
+    // True when any cell may hold a non-null underline color or nonzero
+    // hyperlink id — lets hot clear paths skip the ul/hl array memsets.
+    has_ul_hl_cells: bool = false,
     vt52_mode: bool = false,
 
     // Deferred wrap (VT100 CURSOR_WRAPNEXT)
@@ -271,6 +274,7 @@ pub const Term = struct {
     alt_saved_cursor: CursorState = .{},
     alt_has_truecolor_cells: bool = false,
     alt_has_wide_chars: bool = false,
+    alt_has_ul_hl_cells: bool = false,
 
     pub fn init(allocator: Allocator, cols: u32, rows: u32) !Self {
         const total = @as(usize, cols) * @as(usize, rows);
@@ -942,6 +946,10 @@ pub const Term = struct {
         self.has_truecolor_cells = self.alt_has_truecolor_cells;
         self.alt_has_truecolor_cells = tmp_tc;
 
+        const tmp_uh = self.has_ul_hl_cells;
+        self.has_ul_hl_cells = self.alt_has_ul_hl_cells;
+        self.alt_has_ul_hl_cells = tmp_uh;
+
         const tmp_wc = self.has_wide_chars;
         self.has_wide_chars = self.alt_has_wide_chars;
         self.alt_has_wide_chars = tmp_wc;
@@ -1012,8 +1020,10 @@ pub const Term = struct {
             @memset(self.bg_rgb[phys_start..phys_end], null);
             @memset(self.fg_rgb[phys_start..phys_end], null);
         }
-        @memset(self.ul_color_rgb[phys_start..phys_end], null);
-        @memset(self.hyperlink_ids[phys_start..phys_end], 0);
+        if (self.has_ul_hl_cells) {
+            @memset(self.ul_color_rgb[phys_start..phys_end], null);
+            @memset(self.hyperlink_ids[phys_start..phys_end], 0);
+        }
     }
 
     /// Fix wide character boundaries at the edges of an erase/delete range.
@@ -1098,8 +1108,11 @@ pub const Term = struct {
                     @memset(self.fg_rgb[0..total], null);
                     self.has_truecolor_cells = false;
                 }
-                @memset(self.ul_color_rgb[0..total], null);
-                @memset(self.hyperlink_ids[0..total], 0);
+                if (self.has_ul_hl_cells) {
+                    @memset(self.ul_color_rgb[0..total], null);
+                    @memset(self.hyperlink_ids[0..total], 0);
+                    self.has_ul_hl_cells = false;
+                }
                 self.has_wide_chars = false;
             },
             else => {},

@@ -546,11 +546,13 @@ pub fn feedBulk(parser: *Parser, data: []const u8, term: *Term, writer_fd: ?std.
                 // SIMD path: check 16 bytes at a time for printable ASCII range
                 const VEC_LEN = 16;
                 const Vec = @Vector(VEC_LEN, u8);
+                // Single range check per lane: x in [0x20, 0x7E] <=> (x -% 0x20) <= 0x5E,
+                // halving the compare+reduce work vs separate lo/hi tests.
                 const lo: Vec = @splat(0x20);
-                const hi: Vec = @splat(0x7E);
+                const range: Vec = @splat(0x5E);
                 while (count + VEC_LEN <= max_scan) {
                     const chunk: Vec = data[i + count ..][0..VEC_LEN].*;
-                    if (@reduce(.And, chunk >= lo) and @reduce(.And, chunk <= hi)) {
+                    if (@reduce(.And, (chunk -% lo) <= range)) {
                         count += VEC_LEN;
                     } else break;
                 }
@@ -618,9 +620,16 @@ pub fn feedBulk(parser: *Parser, data: []const u8, term: *Term, writer_fd: ?std.
                     @memset(term.fg_rgb[phys_start .. phys_start + count], null);
                     @memset(term.bg_rgb[phys_start .. phys_start + count], null);
                 }
-                // Underline color + hyperlink metadata
-                @memset(term.ul_color_rgb[phys_start .. phys_start + count], term.current_ul_color_rgb);
-                @memset(term.hyperlink_ids[phys_start .. phys_start + count], term.current_hyperlink_id);
+                // Underline color + hyperlink metadata — same lazy scheme as
+                // TrueColor above: skip the writes while both arrays are clean.
+                if (term.current_ul_color_rgb != null or term.current_hyperlink_id != 0) {
+                    @memset(term.ul_color_rgb[phys_start .. phys_start + count], term.current_ul_color_rgb);
+                    @memset(term.hyperlink_ids[phys_start .. phys_start + count], term.current_hyperlink_id);
+                    term.has_ul_hl_cells = true;
+                } else if (term.has_ul_hl_cells) {
+                    @memset(term.ul_color_rgb[phys_start .. phys_start + count], null);
+                    @memset(term.hyperlink_ids[phys_start .. phys_start + count], 0);
+                }
                 // Bulk dirty (logical index)
                 const logical_start = @as(usize, term.cursor_y) * @as(usize, cols) + term.cursor_x;
                 term.markDirtyRange(.{ .start = logical_start, .end = logical_start + count });
@@ -768,6 +777,8 @@ pub fn feedBulk(parser: *Parser, data: []const u8, term: *Term, writer_fd: ?std.
                 }
                 term.ul_color_rgb[phys_idx] = term.current_ul_color_rgb;
                 term.hyperlink_ids[phys_idx] = term.current_hyperlink_id;
+                if (term.current_ul_color_rgb != null or term.current_hyperlink_id != 0)
+                    term.has_ul_hl_cells = true;
                 const logical_idx = @as(usize, term.cursor_y) * @as(usize, cols) + term.cursor_x;
                 dirty_run_end = logical_idx + 1;
                 term.last_printed_char = cp;
@@ -1264,6 +1275,8 @@ fn handlePrint(cp: u21, term: *Term) void {
         term.ul_color_rgb[phys_idx] = null;
     }
     term.hyperlink_ids[phys_idx] = term.current_hyperlink_id;
+    if (term.current_ul_color_rgb != null or term.current_hyperlink_id != 0)
+        term.has_ul_hl_cells = true;
     const dirty_idx = @as(usize, term.cursor_y) * cols + @as(usize, term.cursor_x);
     term.dirty.set(dirty_idx);
     term.dirty_flag = true;

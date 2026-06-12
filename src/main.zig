@@ -225,6 +225,10 @@ fn kqueueSetPtyWrite(kq: i32, pty_fd: posix.fd_t, enable: bool) void {
 const PtyWriteQueue = struct {
     allocator: std.mem.Allocator,
     pending: std.ArrayListUnmanaged(u8) = .empty,
+    // Consumed prefix of `pending` — discardPrefix just advances this instead
+    // of memmoving the whole tail on every partial PTY write; the buffer is
+    // compacted lazily in append() once the dead prefix dominates.
+    head: usize = 0,
 
     fn init(allocator: std.mem.Allocator) PtyWriteQueue {
         return .{ .allocator = allocator };
@@ -235,22 +239,29 @@ const PtyWriteQueue = struct {
     }
 
     fn len(self: *const PtyWriteQueue) usize {
-        return self.pending.items.len;
+        return self.pending.items.len - self.head;
+    }
+
+    fn slice(self: *const PtyWriteQueue) []const u8 {
+        return self.pending.items[self.head..];
     }
 
     fn append(self: *PtyWriteQueue, data: []const u8) !void {
+        if (self.head > 0 and self.head >= self.pending.items.len / 2) {
+            const remaining = self.pending.items.len - self.head;
+            std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[self.head..]);
+            self.pending.items.len = remaining;
+            self.head = 0;
+        }
         try self.pending.appendSlice(self.allocator, data);
     }
 
     fn discardPrefix(self: *PtyWriteQueue, count: usize) void {
-        if (count >= self.pending.items.len) {
+        self.head += @min(count, self.len());
+        if (self.head == self.pending.items.len) {
+            self.head = 0;
             self.pending.clearRetainingCapacity();
-            return;
         }
-
-        const remaining = self.pending.items.len - count;
-        std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[count..]);
-        self.pending.items.len = remaining;
     }
 };
 
@@ -309,7 +320,7 @@ fn ptyFlushPending(
 ) bool {
     if (write_queue.len() == 0) return true;
 
-    const written = pty_ptr.write(write_queue.pending.items) catch |err| switch (err) {
+    const written = pty_ptr.write(write_queue.slice()) catch |err| switch (err) {
         error.WouldBlock => return true, // try again later
         else => return false,
     };
@@ -338,6 +349,24 @@ test "PtyWriteQueue preserves data beyond fixed buffer sizes" {
 
     queue.discardPrefix(queue.len());
     try std.testing.expectEqual(@as(usize, 0), queue.len());
+}
+
+test "PtyWriteQueue head offset keeps data intact across discard and append" {
+    var queue = PtyWriteQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.append("hello");
+    queue.discardPrefix(2); // head advances, no compaction yet
+    try std.testing.expectEqualStrings("llo", queue.slice());
+
+    // head (2) < items.len/2 is false here (2 >= 5/2) — append compacts.
+    try queue.append(" world");
+    try std.testing.expectEqualStrings("llo world", queue.slice());
+    try std.testing.expectEqual(@as(usize, 0), queue.head);
+
+    queue.discardPrefix(queue.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.head);
 }
 
 /// Reset cursor blink idle tracking on user input (all backend dispatch paths use handleBackendEvent).
