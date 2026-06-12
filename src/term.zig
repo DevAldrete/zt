@@ -514,6 +514,12 @@ pub const Term = struct {
 
     inline fn pushPhysRowToScrollback(self: *Self, phys_row: u32) void {
         if (config.scrollback_lines == 0) return;
+        // If scrollback.resize() failed (OOM) during the last grid resize,
+        // the ring is still at the old column width; pushing a row of
+        // self.cols cells would violate pushRow's length invariant (assert
+        // in safe builds, mismatched @memcpy UB in release). Drop new
+        // history until a later resize succeeds.
+        if (self.scrollback.cols != self.cols) return;
         const start: usize = @as(usize, phys_row) * @as(usize, self.cols);
         self.scrollback.pushRow(
             self.cells[start..][0..self.cols],
@@ -631,11 +637,17 @@ pub const Term = struct {
         self.scrollMarkDirty();
     }
 
-    pub fn resize(self: *Self, new_cols: u32, new_rows: u32) !void {
+    pub fn resize(self: *Self, req_cols: u32, req_rows: u32) !void {
         // Reject degenerate dimensions up front: a zero in either axis
         // would zero-divide in the alt-buffer recovery branch below and
         // produce a bogus row_map anyway.
-        if (new_cols == 0 or new_rows == 0) return error.InvalidSize;
+        if (req_cols == 0 or req_rows == 0) return error.InvalidSize;
+        // Clamp to u16 range: struct winsize carries u16 cols/rows, the VT
+        // layer narrows row/col values to u16 (DECSTBM default bottom), and
+        // scrollback used_cols is u16 — dimensions beyond 65535 would trap
+        // those @intCasts.
+        const new_cols = @min(req_cols, std.math.maxInt(u16));
+        const new_rows = @min(req_rows, std.math.maxInt(u16));
         const new_total = @as(usize, new_cols) * @as(usize, new_rows);
 
         // ========================================================
@@ -815,6 +827,8 @@ pub const Term = struct {
             sel.end_y = @min(sel.end_y, max_y);
         }
 
+        self.saved_cursor.scroll_top = @min(self.saved_cursor.scroll_top, new_rows -| 1);
+        self.saved_cursor.scroll_bottom = @min(self.saved_cursor.scroll_bottom, new_rows -| 1);
         self.alt_saved_cursor.scroll_top = @min(self.alt_saved_cursor.scroll_top, new_rows -| 1);
         self.alt_saved_cursor.scroll_bottom = @min(self.alt_saved_cursor.scroll_bottom, new_rows -| 1);
 
@@ -838,8 +852,9 @@ pub const Term = struct {
 
         // Resize the scrollback ring to match the new column count and clamp
         // view_offset to whatever the (unchanged) scrollback.count allows.
-        // OOM here leaves stale-cols scrollback but a functional terminal —
-        // acceptable for v1 since scrollback is a read-only history view.
+        // OOM here leaves stale-cols scrollback but a functional terminal:
+        // pushPhysRowToScrollback skips pushes while cols mismatch, and the
+        // render loop clamps row reads to the view's actual width.
         if (config.scrollback_lines > 0) {
             self.scrollback.resize(new_cols) catch |err| {
                 std.log.err("scrollback resize: {}", .{err});
@@ -1692,6 +1707,35 @@ test "Term: resize forwards to scrollback and preserves content" {
     try testing.expectEqual(@as(u21, 'C'), v.cells[2].char);
     // view_offset was 1, scrollback.count is 1, no clamp needed.
     try testing.expectEqual(@as(u32, 1), term.view_offset);
+}
+
+test "Term: resize clamps dimensions to u16 range" {
+    var term = try Term.init(testing.allocator, 10, 5);
+    defer term.deinit();
+
+    // Beyond-u16 requests must clamp, not trap downstream u16 @intCasts
+    // (DECSTBM default bottom, scrollback used_cols).
+    try term.resize(10, 70000);
+    try testing.expectEqual(@as(u32, 65535), term.rows);
+    try testing.expectEqual(@as(u32, 10), term.cols);
+}
+
+test "Term: scrollback push is skipped while cols mismatch after failed resize" {
+    if (config.scrollback_lines == 0) return error.SkipZigTest;
+    var term = try Term.init(testing.allocator, 5, 3);
+    defer term.deinit();
+    term.scroll_bottom = 2;
+
+    term.scrollUp(1);
+    try testing.expectEqual(@as(u32, 1), term.scrollback.count);
+
+    // Simulate a scrollback resize that failed under OOM: the ring is still
+    // at the old width while the grid moved on. Pushes must be dropped
+    // instead of violating pushRow's length invariant.
+    term.cols = 4;
+    term.scrollUp(1);
+    try testing.expectEqual(@as(u32, 1), term.scrollback.count);
+    term.cols = 5;
 }
 
 test "Term: resize clamps view_offset down when scrollback shrinks below it" {

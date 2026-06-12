@@ -466,6 +466,17 @@ fn dispatchClipboardCopy(data: []const u8) void {
         posix.close(pipe_fds[0]);
         posix.close(pipe_fds[1]);
 
+        // Reset the inherited signal mask: setupSignals() blocks
+        // SIGCHLD/TERM/INT/HUP (+ SIGPIPE on Linux) process-wide, and the
+        // exec'd helper must not run with those permanently blocked.
+        if (is_linux) {
+            var empty_set = linux.sigemptyset();
+            _ = linux.sigprocmask(linux.SIG.SETMASK, &empty_set, null);
+        } else {
+            var empty_set = std.mem.zeroes(std.c.sigset_t);
+            _ = std.c.sigprocmask(std.c.SIG.SETMASK, &empty_set, null);
+        }
+
         // Use minimal environment to avoid LD_PRELOAD/PATH hijacking
         var display_env_buf: [128]u8 = undefined;
         var wayland_env_buf: [128]u8 = undefined;
@@ -500,10 +511,15 @@ fn dispatchClipboardCopy(data: []const u8) void {
         posix.exit(1);
     }
 
-    // Parent: write data to pipe write end, close read end immediately
+    // Parent: write data to pipe write end, close read end immediately.
+    // Loop on short writes — payloads larger than the pipe capacity would
+    // otherwise be silently truncated.
     posix.close(pipe_fds[0]);
-    if (data.len > 0) {
-        _ = posix.write(pipe_fds[1], data) catch {};
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = posix.write(pipe_fds[1], data[off..]) catch break;
+        if (n == 0) break;
+        off += n;
     }
     posix.close(pipe_fds[1]); // EOF signals end of data to child
 }
@@ -1623,8 +1639,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const dirty_row_base = @as(usize, live_y) * @as(usize, term.cols);
             const sel_opt = term.selection;
 
+            // Scrollback rows can be narrower than the live grid if a
+            // scrollback resize failed under OOM — clamp to the actual
+            // row width so the indexing below stays in bounds.
+            const row_cols: u32 = @min(term.cols, @as(u32, @intCast(row_cells.len)));
             var x: u32 = 0;
-            while (x < term.cols) : (x += 1) {
+            while (x < row_cols) : (x += 1) {
                 if (!all_dirty and !force_redraw and !term.dirty.isSet(dirty_row_base + x)) continue;
 
                 const cell = &row_cells[x];

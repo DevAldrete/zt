@@ -136,10 +136,15 @@ pub const Pty = struct {
                 _ = linux.syscall0(.setsid);
             }
 
-            // Reset signal mask — parent may have blocked signals for signalfd
+            // Reset signal mask — the parent blocks SIGCHLD/TERM/INT/HUP
+            // (signalfd on Linux, kqueue-style handling on macOS); the shell
+            // must not inherit that mask or Ctrl+C and job control break.
             if (is_linux) {
                 var empty_set = linux.sigemptyset();
                 _ = linux.sigprocmask(linux.SIG.SETMASK, &empty_set, null);
+            } else {
+                var empty_set = std.mem.zeroes(std.c.sigset_t);
+                _ = std.c.sigprocmask(std.c.SIG.SETMASK, &empty_set, null);
             }
 
             // b. Open slave fd
