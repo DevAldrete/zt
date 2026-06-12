@@ -43,6 +43,7 @@ Measured on Intel i5-12450H, 1 CPU core, X11 (:0, hardware GPU), `-Doptimize=Rel
 - **Bulk ASCII fast path** — SIMD 16-byte range check, 8-byte template cell writes
 - **UTF-8 bulk path** — multi-byte sequences decoded directly in ground state
 - **Row-map scroll** — O(1) scroll via row indirection instead of copying cells
+- **Lazy metadata planes** — TrueColor, underline-color and hyperlink arrays are only written while those features are in use
 - **Damage tracking** — per-cell dirty flag, row-level skip
 - **Comptime configuration** — backend, font, palette, scale resolved at compile time
 
@@ -200,6 +201,17 @@ epoll event loop (single-threaded)
 ├── Backend (fbdev mmap / X11 SHM / Wayland wl_shm)
 └── Signals, timers, write buffering
 ```
+
+## Keybindings
+
+| Keys | Action |
+|------|--------|
+| `Ctrl+Shift+C` | Copy selection to clipboard (X11/Wayland) |
+| `Ctrl+Shift+V` | Paste from clipboard (X11/Wayland) |
+| `Shift+PageUp` / `Shift+PageDown` | Scroll scrollback one page up / down |
+| `Shift+Home` / `Shift+End` | Jump to scrollback top / live bottom |
+| Left-click drag | Select text |
+| Mouse wheel | Scrollback (main screen) / arrow keys (alt screen) / app (mouse capture) |
 
 ## Tested Applications
 
