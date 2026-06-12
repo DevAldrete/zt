@@ -1,5 +1,6 @@
 .zig-cache/
 zig-out/
+zig-out-*/
 
 # Font files (generate locally with scripts/)
 fonts/
