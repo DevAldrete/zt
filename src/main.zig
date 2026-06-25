@@ -488,9 +488,12 @@ fn dispatchClipboardCopy(data: []const u8) void {
 
     if (pid == 0) {
         // Child: redirect stdin from pipe read end.
-        // All other inherited fds (PTY master, signalfd, epoll_fd, evdev, backend
-        // socket) carry O_CLOEXEC and are closed automatically by the kernel on
-        // execvpeZ.  No explicit closefrom loop is needed.
+        // All other inherited fds (PTY master, signalfd, epoll_fd, evdev,
+        // backend socket) carry O_CLOEXEC and are closed automatically by
+        // the kernel on execvpeZ.  The pipe fds themselves are also opened
+        // with O_CLOEXEC (see posix.pipe), but the read end we dup2 onto
+        // stdin: dup2 clears the FD_CLOEXEC flag, so the child inherits a
+        // readable stdin as intended.  The write end stays closed-on-exec.
         posix.dup2(pipe_fds[0], 0) catch posix.exit(1);
         posix.close(pipe_fds[0]);
         posix.close(pipe_fds[1]);

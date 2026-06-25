@@ -316,12 +316,26 @@ pub const Pty = struct {
         for (0..5) |_| {
             posix.sleep(50 * std.time.ns_per_ms);
             if (is_linux) {
+                // wait4 with WNOHANG returns:
+                //   rc > 0      → child PID, child was reaped
+                //   rc == 0     → child still running (NOT a success!)
+                //   rc < 0      → error; errno==ECHILD means already reaped
+                // The previous code checked `errno(rc) == .SUCCESS`,
+                // which is true for both rc>0 (reaped) and rc==0
+                // (still running), so it never escalated to SIGKILL.
+                // Mirror the macOS branch: rely on the return value, not errno.
                 const rc = linux.syscall4(.wait4, @as(usize, @intCast(self.child_pid)), 0, linux.W.NOHANG, 0);
-                const err = linux.errno(rc);
-                if (err == .SUCCESS or err == .CHILD) {
+                const rc_isize: isize = @bitCast(rc);
+                if (rc_isize > 0) {
                     reaped = true;
                     break;
                 }
+                if (rc_isize < 0 and linux.errno(rc) == .CHILD) {
+                    // No child to wait for — already reaped by SIGCHLD handler.
+                    reaped = true;
+                    break;
+                }
+                // rc == 0: child still alive, keep polling.
             } else {
                 const rc = std.c.waitpid(self.child_pid, null, 1); // WNOHANG=1
                 if (rc > 0) {

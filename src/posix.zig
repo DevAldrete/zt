@@ -119,7 +119,13 @@ const pipe_map = [_]ErrnoEntry{
 pub inline fn pipe() PipeError![2]fd_t {
     if (builtin.os.tag != .linux) @compileError(linux_only_msg);
     var fds: [2]i32 = undefined;
-    const rc = linux.pipe(&fds);
+    // Use pipe2(O_CLOEXEC) so the pipe fds are never leaked to a
+    // future exec'd child (clipboard helper, etc.).  Previously this
+    // called linux.pipe(), which created fds WITHOUT O_CLOEXEC; the
+    // callers had to remember to set FD_CLOEXEC by hand, and any
+    // early-return path in a forked child would leak the read/write
+    // ends into the exec'd program.
+    const rc = linux.pipe2(&fds, .{ .CLOEXEC = true });
     const e = linux.errno(rc);
     if (e == .SUCCESS) return fds;
     return @errorCast(mapErrno(e, &pipe_map));
