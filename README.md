@@ -35,6 +35,7 @@ Measured on Intel i5-12450H, 1 CPU core, X11 (:0, hardware GPU), `-Doptimize=Rel
 - **59,635 glyphs** — UFO bitmap font + Nerd Fonts icons, embedded at compile time
 - **XKB keyboard layout** — any X11/Wayland layout (US, JP, DE, FR, etc.)
 - **Input method** — XIM under X11, text-input-v3 under Wayland (fcitx5, ibus, etc.)
+- **Inline pre-edit (IME composition)** — Wayland `text-input-v3` preedit; composition text is rendered at the cursor position with reverse-video / underline / highlight feedback from the IME
 - **OSC 8 hyperlinks** — parsed and stored; click-to-open is not yet implemented
 - **OSC 52 clipboard** — copy to system clipboard via xclip/wl-copy (disabled by default for security)
 
@@ -94,6 +95,10 @@ zig build -Dbackend=x11 -Dscrollback_lines=0 -Doptimize=ReleaseFast
 
 # Smaller scrollback (lower memory)
 zig build -Dbackend=x11 -Dscrollback_lines=2000 -Doptimize=ReleaseFast
+
+# Wheel scrolls alt-screen scrollback (for codex CLI / long TUI sessions).
+# Default off: wheel translates to arrow keys in alt screen (less/vim compat).
+zig build -Dbackend=x11 -Dalt_screen_wheel_scrollback=true -Doptimize=ReleaseFast
 
 # Custom BDF or TTF font (experimental — see Font section)
 zig build -Dbackend=x11 -Dfont=path/to/myfont.ttf -Doptimize=ReleaseFast
@@ -208,10 +213,10 @@ epoll event loop (single-threaded)
 |------|--------|
 | `Ctrl+Shift+C` | Copy selection to clipboard (X11/Wayland) |
 | `Ctrl+Shift+V` | Paste from clipboard (X11/Wayland) |
-| `Shift+PageUp` / `Shift+PageDown` | Scroll scrollback one page up / down |
-| `Shift+Home` / `Shift+End` | Jump to scrollback top / live bottom |
+| `Shift+PageUp` / `Shift+PageDown` | Scroll scrollback one page up / down (active ring: main or alt-screen) |
+| `Shift+Home` / `Shift+End` | Jump to scrollback top / live bottom (active ring) |
 | Left-click drag | Select text |
-| Mouse wheel | Scrollback (main screen) / arrow keys (alt screen) / app (mouse capture) |
+| Mouse wheel | Scrollback (main screen) / arrow keys (alt screen, default) / scrollback (alt screen with `-Dalt_screen_wheel_scrollback=true`) / app (mouse capture) |
 
 ## Tested Applications
 
@@ -221,11 +226,11 @@ Some applications may have minor rendering issues due to missing features (see b
 
 ## Limitations
 
-- **Scrollback** — fixed capacity, set at compile time via `-Dscrollback_lines=N` (default 10000, 0 disables). No reflow on column resize, no selection of scrollback rows yet.
-- **Mouse wheel** — scrolls scrollback in main screen; translates to arrow keys for `less`/`vim` in alt screen; passes through to apps with mouse capture (`mouse_mode != .none`).
+- **Scrollback** — fixed capacity, set at compile time via `-Dscrollback_lines=N` (default 10000, 0 disables). No reflow on column resize, no selection of scrollback rows yet. Both the main screen and the alt screen have their own session-scoped scrollback rings: the alt ring is created on enter-alt and freed on leave-alt, so `less`/`vim`/`codex` history is scoped to that session and never pollutes the main ring.
+- **Mouse wheel** — scrolls scrollback in main screen; translates to arrow keys for `less`/`vim` in alt screen (default); scrolls the alt-screen ring when `-Dalt_screen_wheel_scrollback=true` is set at build time (opt-in for `codex`-style sessions); passes through to apps with mouse capture (`mouse_mode != .none`).
 - **No clipboard paste on fbdev** — X11/Wayland support Ctrl+Shift+V
-- **No inline pre-edit display** — IME uses its own popup window
 - **Bitmap rendering only** — single embedded blob (1-bit, fixed 8×16 cell), no antialiasing, no runtime system font lookup or fallback. A custom BDF or TTF can be embedded at build time via `-Dfont` (experimental, see [Font](#custom-fonts-experimental))
+- **No X11 inline pre-edit display** — XIM uses `PreeditNothing`, so the IME handles composition display
 - **No ligatures**
 - **No sixel/image protocol**
 - **Blink attribute** — parsed but not visually rendered
