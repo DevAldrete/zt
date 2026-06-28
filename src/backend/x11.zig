@@ -40,6 +40,7 @@ pub const MouseEvent = struct {
 pub const Event = union(enum) {
     key: KeyEvent,
     text: TextEvent,
+    preedit: PreeditEvent,
     paste: PasteEvent,
     resize: ResizeEvent,
     expose: void,
@@ -65,6 +66,22 @@ pub const TextEvent = struct {
     len: u32 = 0,
 
     pub fn slice(self: *const TextEvent) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Shared pre-edit event shape for the main dispatcher.
+/// X11 currently uses XIMPreeditNothing, so this backend does not emit it.
+pub const PreeditEvent = struct {
+    data: [128]u8 = undefined,
+    len: u32 = 0,
+    caret: u32 = 0,
+    active: bool = false,
+    // Per-byte feedback flags, indexed in lockstep with `data`.
+    // Bit 0 = reverse, Bit 1 = underline, Bit 2 = highlight.
+    feedback: [128]u8 = [_]u8{0} ** 128,
+
+    pub fn slice(self: *const PreeditEvent) []const u8 {
         return self.data[0..self.len];
     }
 };
@@ -565,8 +582,8 @@ pub const X11Backend = struct {
         const self: *Self = @ptrCast(@alignCast(user_data));
         self.xim_connected = true;
 
-        // PreeditNothing: IME handles preedit display in its own popup.
-        // XNSpotLocation tells the IME where to position it.
+        // XIMPreeditNothing (0x0008): IM handles preedit display in its own
+        // popup window. XNSpotLocation tells the IM where to position it.
         const input_style: u32 = 0x0008 | 0x0400; // XIMPreeditNothing | XIMStatusNothing
         var spot = c.xcb_point_t{ .x = 0, .y = 0 };
         var nested = c.xcb_xim_create_nested_list(xim, c.XCB_XIM_XNSpotLocation, &spot, @as(?*anyopaque, null));
@@ -590,8 +607,10 @@ pub const X11Backend = struct {
     fn ximCreateIcCallback(_: ?*c.xcb_xim_t, ic: c.xcb_xic_t, user_data: ?*anyopaque) callconv(.c) void {
         const self: *Self = @ptrCast(@alignCast(user_data));
         self.xic = ic;
-        if (self.xim) |xim| {
-            _ = c.xcb_xim_set_ic_focus(xim, ic);
+        if (ic != 0) {
+            if (self.xim) |xim| {
+                _ = c.xcb_xim_set_ic_focus(xim, ic);
+            }
         }
     }
 
@@ -936,7 +955,7 @@ pub const X11Backend = struct {
             }
         }
 
-        // First, check if XIM callbacks produced events
+        // First, check if XIM callbacks produced events.
         if (self.has_committed) {
             self.has_committed = false;
             if (self.suppress_xim_result) {
@@ -966,10 +985,11 @@ pub const X11Backend = struct {
             };
             defer std.c.free(event);
 
+            const event_type = event.*.response_type & 0x7F;
             // Let XIM filter the event first — MUST run even before xim_connected
             // because xcb-imdkit uses this to process the XIM protocol handshake
             if (self.xim) |xim| {
-                if (c.xcb_xim_filter_event(xim, event)) {
+                if (shouldFilterXimEvent(event_type, self.xic) and c.xcb_xim_filter_event(xim, event)) {
                     // XIM consumed the event — check if it produced committed text
                     if (self.has_committed) {
                         self.has_committed = false;
@@ -991,7 +1011,6 @@ pub const X11Backend = struct {
                 }
             }
 
-            const event_type = event.*.response_type & 0x7F;
             switch (event_type) {
                 c.XCB_KEY_PRESS => {
                     // Lazy-init XKB+XIM on first key press (not on non-key events,
@@ -1377,4 +1396,18 @@ fn xcbStateToMods(state: u16) input_mod.Modifiers {
         .alt = (state & c.XCB_MOD_MASK_1) != 0, // Mod1 = Alt
         .meta = (state & c.XCB_MOD_MASK_4) != 0, // Mod4 = Super
     };
+}
+
+fn shouldFilterXimEvent(event_type: u8, xic: c.xcb_xic_t) bool {
+    return switch (event_type) {
+        c.XCB_KEY_PRESS, c.XCB_KEY_RELEASE => xic != 0,
+        else => true,
+    };
+}
+
+test "XIM filter leaves raw key events alone until IC exists" {
+    try std.testing.expect(!shouldFilterXimEvent(c.XCB_KEY_PRESS, 0));
+    try std.testing.expect(!shouldFilterXimEvent(c.XCB_KEY_RELEASE, 0));
+    try std.testing.expect(shouldFilterXimEvent(c.XCB_CLIENT_MESSAGE, 0));
+    try std.testing.expect(shouldFilterXimEvent(c.XCB_KEY_PRESS, 1));
 }

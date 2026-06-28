@@ -40,6 +40,12 @@ pub const TextInputState = struct {
     enabled: bool = false,
     preedit_text: [256]u8 = undefined,
     preedit_len: usize = 0,
+    /// Byte offset within preedit_text of the composition cursor / selection start.
+    /// Wayland text-input-v3 delivers cursor_begin and cursor_end as character
+    /// indices; we translate to bytes in handlePreeditString.
+    preedit_cursor_begin: u32 = 0,
+    /// Byte offset of the selection end (== cursor_begin for a bare caret).
+    preedit_cursor_end: u32 = 0,
     pending_commit: [256]u8 = undefined,
     pending_commit_len: usize = 0,
     has_pending_commit: bool = false,
@@ -111,13 +117,41 @@ pub fn commit(conn: *wire.Connection, text_input_id: u32) !void {
 
 /// Handle zwp_text_input_v3.preedit_string event.
 /// Payload: text(string) + cursor_begin(i32) + cursor_end(i32)
+/// cursor_begin/end are character indices into the UTF-8 preedit text;
+/// we translate them to byte offsets so the renderer can apply per-byte
+/// styling consistently with the XIM backend.
 pub fn handlePreeditString(state: *TextInputState, payload: []const u8) void {
     var pos: usize = 0;
     const text = wire.getString(payload, &pos);
-    // cursor_begin and cursor_end are present but not used for terminal
+    // cursor_begin and cursor_end follow as signed 32-bit ints.
+    var cb: i32 = 0;
+    var ce: i32 = 0;
+    if (pos + 4 <= payload.len) {
+        cb = wire.getInt(payload, &pos);
+    }
+    if (pos + 4 <= payload.len) {
+        ce = wire.getInt(payload, &pos);
+    }
     const clamped = @min(text.len, state.preedit_text.len);
     @memcpy(state.preedit_text[0..clamped], text[0..clamped]);
     state.preedit_len = clamped;
+    state.preedit_cursor_begin = charIdxToByteOffset(text, cb);
+    state.preedit_cursor_end = charIdxToByteOffset(text, ce);
+}
+
+/// Translate a character index (possibly negative or out-of-range) into a
+/// byte offset within the UTF-8 string. Clamps to [0, text.len].
+fn charIdxToByteOffset(text: []const u8, char_idx: i32) u32 {
+    if (char_idx <= 0) return 0;
+    var i: usize = 0;
+    var seen: i32 = 0;
+    while (i < text.len and seen < char_idx) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+        if (i + len > text.len) break;
+        i += len;
+        seen += 1;
+    }
+    return @intCast(i);
 }
 
 /// Handle zwp_text_input_v3.commit_string event.
@@ -166,6 +200,23 @@ test "handlePreeditString stores text" {
     wire.putInt(&payload, &pos, 4);
     handlePreeditString(&state, payload[0..pos]);
     try std.testing.expectEqualStrings("test", state.preeditSlice());
+    try std.testing.expectEqual(@as(u32, 0), state.preedit_cursor_begin);
+    try std.testing.expectEqual(@as(u32, 4), state.preedit_cursor_end);
+}
+
+test "handlePreeditString translates char index to byte offset for multibyte" {
+    var state = TextInputState{};
+    // "あいう" = 3 codepoints, 9 bytes (each hiragana is 3 bytes UTF-8).
+    // Place caret at char index 2 (=byte offset 6).
+    var payload: [64]u8 = undefined;
+    var pos: usize = 0;
+    wire.putString(&payload, &pos, "あいう");
+    wire.putInt(&payload, &pos, 2);
+    wire.putInt(&payload, &pos, 3);
+    handlePreeditString(&state, payload[0..pos]);
+    try std.testing.expectEqual(@as(usize, 9), state.preedit_len);
+    try std.testing.expectEqual(@as(u32, 6), state.preedit_cursor_begin);
+    try std.testing.expectEqual(@as(u32, 9), state.preedit_cursor_end);
 }
 
 test "handleCommitString stores text and sets pending flag" {

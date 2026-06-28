@@ -44,6 +44,7 @@ pub const MouseEvent = struct {
 pub const Event = union(enum) {
     key: KeyEvent,
     text: TextEvent,
+    preedit: PreeditEvent,
     paste: PasteEvent,
     resize: ResizeEvent,
     expose: void,
@@ -69,6 +70,22 @@ pub const TextEvent = struct {
     len: u32 = 0,
 
     pub fn slice(self: *const TextEvent) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Inline pre-edit (IME composition) event.
+/// Wayland backend stub: text-input-v3 preedit handling is not yet wired
+/// through here, so this struct exists only to satisfy the shared render
+/// dispatch in main.zig. Fields mirror the X11 backend's PreeditEvent.
+pub const PreeditEvent = struct {
+    data: [128]u8 = undefined,
+    len: u32 = 0,
+    caret: u32 = 0,
+    active: bool = false,
+    feedback: [128]u8 = [_]u8{0} ** 128,
+
+    pub fn slice(self: *const PreeditEvent) []const u8 {
         return self.data[0..self.len];
     }
 };
@@ -1321,7 +1338,7 @@ pub const WaylandBackend = struct {
             text_input_mod.ZWP_TEXT_INPUT_EVENT_DONE => {
                 text_input_mod.handleDone(&self.text_input);
 
-                // If there is a committed string, queue a text event
+                // If there is a committed string, queue a text event first
                 if (self.text_input.has_pending_commit and self.text_input.pending_commit_len > 0) {
                     var text_ev: TextEvent = .{};
                     const len: u32 = @intCast(@min(self.text_input.pending_commit_len, text_ev.data.len));
@@ -1332,9 +1349,43 @@ pub const WaylandBackend = struct {
                     self.text_input.has_pending_commit = false;
                     self.text_input.pending_commit_len = 0;
                 }
+
+                // Queue the current preedit state as Event.preedit so the
+                // render loop displays/refreshes/clears the inline composition.
+                // handleDone already cleared preedit_len on commit, so after
+                // a commit this naturally sends an empty (inactive) preedit,
+                // wiping the previous overlay. On pure preedit updates
+                // (no commit) it forwards the latest composition text.
+                self.queuePreeditEvent();
             },
             else => {},
         }
+    }
+
+    /// Build an Event.preedit from the current text_input state and queue it.
+    /// text-input-v3 has no per-character feedback array like XIM, so we
+    /// synthesize one: bytes inside the selection range [cursor_begin, cursor_end)
+    /// get the "highlight" bit (rendered reverse), and every byte in the
+    /// composition gets the "underline" bit so unselected segments are still
+    /// visually distinguished from committed text.
+    fn queuePreeditEvent(self: *Self) void {
+        var ev: PreeditEvent = .{};
+        const len = @min(self.text_input.preedit_len, ev.data.len);
+        @memcpy(ev.data[0..len], self.text_input.preedit_text[0..len]);
+        ev.len = @intCast(len);
+        ev.active = len > 0;
+        ev.caret = @min(self.text_input.preedit_cursor_begin, @as(u32, @intCast(len)));
+        // Build per-byte feedback: underline everywhere, highlight in selection.
+        @memset(&ev.feedback, 0);
+        if (len > 0) {
+            const sel_begin = @min(self.text_input.preedit_cursor_begin, @as(u32, @intCast(len)));
+            const sel_end = @min(self.text_input.preedit_cursor_end, @as(u32, @intCast(len)));
+            for (0..len) |i| {
+                ev.feedback[i] = 0x02; // underline
+                if (i >= sel_begin and i < sel_end) ev.feedback[i] |= 0x04; // highlight
+            }
+        }
+        self.queueEvent(.{ .preedit = ev });
     }
 
     pub fn pollEvents(self: *Self) ?Event {
