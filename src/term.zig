@@ -167,6 +167,14 @@ pub const Term = struct {
     view_offset: if (config.scrollback_lines > 0) u32 else void =
         if (config.scrollback_lines > 0) 0 else {},
 
+    // Alt-screen scrollback ring. Per-alt-session: created on enter-alt and
+    // freed on leave-alt so history stays scoped to the app that produced it
+    // (`less`/`vim`/`codex` …). When scrollback_lines == 0 this collapses to
+    // `void` (NOT `?void`, which would be non-zero-sized and bloat the
+    // disabled-path `@sizeOf(Term)` snapshot) and pays no memory cost.
+    alt_scrollback: if (config.scrollback_lines > 0) ?Scrollback else void =
+        if (config.scrollback_lines > 0) null else {},
+
     // Cursor
     cursor_x: u32 = 0,
     cursor_y: u32 = 0,
@@ -263,6 +271,19 @@ pub const Term = struct {
     // Backarrow key mode (DECSET ?67): true=BS(0x08), false=DEL(0x7F)
     decbkm: bool = false,
 
+    // Inline IME preedit (composition) text displayed at the cursor position.
+    // Mirrors the X11 backend's PreeditEvent. When `preedit_active` is true,
+    // the render loop overlays `preedit_text` starting at (cursor_x, cursor_y)
+    // instead of drawing the cursor. Changing any of these via setPreedit()
+    // marks the affected rows dirty so the renderer picks it up.
+    preedit_text: [128]u8 = undefined,
+    preedit_len: u32 = 0,
+    preedit_caret: u32 = 0, // byte offset within preedit_text
+    preedit_active: bool = false,
+    // Per-byte feedback flags from the IME (bit 0=reverse, 1=underline,
+    // 2=highlight). Aligned to preedit_text bytes.
+    preedit_feedback: [128]u8 = [_]u8{0} ** 128,
+
     // Saved DEC mode values (XTSAVE/XTRESTORE)
     saved_dec_modes: [32]SavedDecMode = [_]SavedDecMode{.{}} ** 32,
     saved_dec_mode_count: u8 = 0,
@@ -329,6 +350,9 @@ pub const Term = struct {
         self.dirty.deinit();
         if (self.tabs.len > 0) self.allocator.free(self.tabs);
         if (config.scrollback_lines > 0) self.scrollback.deinit();
+        if (config.scrollback_lines > 0) {
+            if (self.alt_scrollback) |*sb| sb.deinit();
+        }
         if (self.alt_cells) |alt| self.allocator.free(alt);
         if (self.alt_row_map) |arm| self.allocator.free(arm);
         if (self.alt_dirty != null) {
@@ -508,24 +532,124 @@ pub const Term = struct {
         self.all_dirty = true;
     }
 
+    /// Update the inline preedit (IME composition) state.
+    /// `text` is UTF-8, `caret` is a byte offset within `text`, `feedback`
+    /// is a per-byte styling bitmask (bit0=reverse, bit1=underline, bit2=highlight).
+    /// When `active` is false the preedit is cleared.
+    ///
+    /// Marks the cursor row dirty so the renderer redraws with/without the
+    /// composition overlay. If the preedit spans multiple cells (CJK wide
+    /// chars), we conservatively mark the entire row dirty.
+    pub fn setPreedit(
+        self: *Self,
+        text: []const u8,
+        caret: u32,
+        feedback: []const u8,
+        active: bool,
+    ) void {
+        const old_active = self.preedit_active;
+        const old_len = self.preedit_len;
+
+        // Always clear the old preedit row first so the renderer doesn't
+        // leave stale composition glyphs on screen.
+        if (old_active and old_len > 0) {
+            self.markDirtyRange(.{
+                .start = @as(usize, self.cursor_y) * @as(usize, self.cols),
+                .end = (@as(usize, self.cursor_y) + 1) * @as(usize, self.cols),
+            });
+        }
+
+        self.preedit_active = active and text.len > 0;
+        const len = @min(text.len, 128);
+        @memcpy(self.preedit_text[0..len], text[0..len]);
+        self.preedit_len = @intCast(len);
+        self.preedit_caret = @min(caret, len);
+        const fb_len = @min(feedback.len, 128);
+        @memset(self.preedit_feedback[0..128], 0);
+        @memcpy(self.preedit_feedback[0..fb_len], feedback[0..fb_len]);
+
+        // Mark the new preedit row dirty so the renderer draws the overlay.
+        if (self.preedit_active) {
+            self.markDirtyRange(.{
+                .start = @as(usize, self.cursor_y) * @as(usize, self.cols),
+                .end = (@as(usize, self.cursor_y) + 1) * @as(usize, self.cols),
+            });
+        }
+    }
+
+    /// Returns true when a `scrollUp`/`scrollDown` should push evicted rows
+    /// into the active scrollback ring. Pushes when the scroll region is
+    /// anchored to AT LEAST ONE screen edge — full-screen scrolls (top==0
+    /// AND bot+1==rows), header-below-content layouts (top==0, bot<rows-1),
+    /// and content-above-footer layouts (top>0, bot+1==rows) all push.
+    /// Excludes only truly floating mid-screen sub-regions (top>0 AND
+    /// bot<rows-1) — i.e. the middle pane of a 3+ pane tmux split. This
+    /// lets ratatui-style TUIs on the main screen (codex-cli, which sets
+    /// partial DECSTBM regions like `ESC[1;7r` / `ESC[8;24r` for header/
+    /// content/footer) accumulate scrollback, while bare multiplexer
+    /// middle-panes don't pollute history with fragment rows.
+    ///
+    /// NOTE: does NOT gate on `is_alt_screen` — alt-screen scrolls are
+    /// routed to the per-session alt ring by `pushTarget()`, so the
+    /// edge-anchored predicate is the same for both screens. The alt ring
+    /// is created/destroyed on enter/leave-alt, so its history stays
+    /// scoped to the alt session regardless of this return value.
     inline fn shouldPushScrollback(self: *const Self) bool {
         if (config.scrollback_lines == 0) return false;
-        if (self.is_alt_screen) return false;
         const top: usize = self.scroll_top;
         const bot: usize = self.scroll_bottom;
-        return top == 0 and bot + 1 == self.rows;
+        return top == 0 or bot + 1 == self.rows;
+    }
+
+    /// Returns a mutable pointer to the scrollback ring that owns the history
+    /// of the currently active screen: main ring while on the main screen,
+    /// the per-session alt ring while on alt screen. Returns null when
+    /// scrollback is compiled out, or when the active ring is missing (alt
+    /// ring not yet allocated, or in OOM-fallback state where the ring cols
+    /// drift from the grid cols).
+    inline fn pushTarget(self: *Self) ?*Scrollback {
+        if (config.scrollback_lines == 0) return null;
+        if (self.is_alt_screen) {
+            if (self.alt_scrollback) |*sb| {
+                // Mirror the same OOM-recovery guard as the main ring: skip
+                // pushes while the ring is still at a stale column width.
+                if (sb.cols != self.cols) return null;
+                return sb;
+            }
+            return null;
+        }
+        if (self.scrollback.cols != self.cols) return null;
+        return &self.scrollback;
+    }
+
+    /// Read-only accessor for the active ring. Used by the render path and
+    /// scrollViewport* helpers. Returns null on the disabled or missing path
+    /// (matches `pushTarget`'s semantics).
+    pub inline fn activeRing(self: *const Self) ?*const Scrollback {
+        if (config.scrollback_lines == 0) return null;
+        if (self.is_alt_screen) {
+            if (self.alt_scrollback) |*sb| return sb;
+            return null;
+        }
+        return &self.scrollback;
+    }
+
+    /// Comptime-known scrollback gate. True when the scrollback feature is
+    /// compiled in (`-Dscrollback_lines>0`); false (and the entire ring API
+    /// collapses to `void`) when compiled out. Useful for callers in modules
+    /// that do not import `config` (e.g. `vt.zig` integration tests).
+    pub fn hasScrollback() bool {
+        return config.scrollback_lines > 0;
     }
 
     inline fn pushPhysRowToScrollback(self: *Self, phys_row: u32) void {
         if (config.scrollback_lines == 0) return;
-        // If scrollback.resize() failed (OOM) during the last grid resize,
-        // the ring is still at the old column width; pushing a row of
-        // self.cols cells would violate pushRow's length invariant (assert
-        // in safe builds, mismatched @memcpy UB in release). Drop new
-        // history until a later resize succeeds.
-        if (self.scrollback.cols != self.cols) return;
+        // Route to the active ring. pushTarget() already encodes the OOM
+        // cols-mismatch guard for both main and alt rings, so we do not
+        // re-check `self.scrollback.cols` here.
+        const target = self.pushTarget() orelse return;
         const start: usize = @as(usize, phys_row) * @as(usize, self.cols);
-        self.scrollback.pushRow(
+        target.pushRow(
             self.cells[start..][0..self.cols],
             self.fg_rgb[start..][0..self.cols],
             self.bg_rgb[start..][0..self.cols],
@@ -612,7 +736,8 @@ pub const Term = struct {
 
     pub fn scrollViewportUp(self: *Self, n: u32) void {
         if (config.scrollback_lines == 0) return;
-        const max: u32 = self.scrollback.count;
+        const ring = self.activeRing() orelse return;
+        const max: u32 = ring.count;
         const new_off = self.view_offset +| n;
         const clamped: u32 = if (new_off > max) max else new_off;
         if (clamped == self.view_offset) return;
@@ -629,8 +754,9 @@ pub const Term = struct {
 
     pub fn scrollViewportToTop(self: *Self) void {
         if (config.scrollback_lines == 0) return;
-        if (self.view_offset == self.scrollback.count) return;
-        self.view_offset = self.scrollback.count;
+        const ring = self.activeRing() orelse return;
+        if (self.view_offset == ring.count) return;
+        self.view_offset = ring.count;
         self.scrollMarkDirty();
     }
 
@@ -863,8 +989,25 @@ pub const Term = struct {
             self.scrollback.resize(new_cols) catch |err| {
                 std.log.err("scrollback resize: {}", .{err});
             };
-            if (self.view_offset > self.scrollback.count) {
-                self.view_offset = self.scrollback.count;
+            // The alt ring mirrors the main ring's column width. Resize it
+            // too so pushes from the alt screen keep satisfying pushRow's
+            // length invariant. OOM leaves the alt ring stale; the push
+            // target guard drops pushes until the next successful resize.
+            if (self.alt_scrollback) |*sb| {
+                sb.resize(new_cols) catch |err| {
+                    std.log.err("alt scrollback resize: {}", .{err});
+                };
+            }
+            // Clamp view_offset against the active ring's count. When there
+            // is no active ring (alt screen with no ring allocated yet, or
+            // both rings OOM'd out) force view_offset to 0 so the render
+            // clamp stays honest.
+            if (self.activeRing()) |ring| {
+                if (self.view_offset > ring.count) {
+                    self.view_offset = ring.count;
+                }
+            } else {
+                self.view_offset = 0;
             }
         }
     }
@@ -910,6 +1053,27 @@ pub const Term = struct {
             self.alt_bg_rgb = abg;
             self.alt_ul_color_rgb = aul;
             self.alt_hyperlink_ids = ahl;
+        }
+
+        // Alt-screen scrollback ring lifecycle: a fresh ring is created on
+        // every enter-alt and freed on every leave-alt. The history is scoped
+        // to the alt-screen session — quitting `less`/`vim`/`codex` drops it,
+        // matching alt-screen's "ephemeral buffer" contract. On OOM the alt
+        // ring stays null and pushes from the alt screen are silently dropped
+        // (pushTarget returns null) — main-screen scrollback is unaffected.
+        if (config.scrollback_lines > 0) {
+            if (alt) {
+                std.debug.assert(self.alt_scrollback == null);
+                self.alt_scrollback = Scrollback.init(self.allocator, config.scrollback_lines, self.cols) catch |err| blk: {
+                    std.log.err("alt scrollback init: {}", .{err});
+                    break :blk null;
+                };
+            } else {
+                if (self.alt_scrollback) |*sb| {
+                    sb.deinit();
+                    self.alt_scrollback = null;
+                }
+            }
         }
 
         // Swap main <-> alt (cells, row_map, dirty, TrueColor, ul_color, hyperlinks)
@@ -1086,12 +1250,20 @@ pub const Term = struct {
                 self.markDirtyRange(.{ .start = 0, .end = end_y * cols + end_x + 1 });
             },
             2, 3 => {
-                // ED 3 ("erase saved lines") additionally drops the scrollback
-                // ring on the main screen. Skipped while in alt so that
-                // `clear` issued from inside `less`/`vim` cannot wipe the
-                // user's history.
-                if (mode == 3 and config.scrollback_lines > 0 and !self.is_alt_screen) {
-                    self.scrollback.clear();
+                // ED 3 ("erase saved lines") clears the scrollback ring of the
+                // ACTIVE screen. On the main screen this preserves the user's
+                // ability to wipe history from the shell; on the alt screen
+                // it lets `clear` issued inside `less`/`vim`/`codex` reset the
+                // session-scoped alt ring without ever touching the main
+                // ring. xterm clears unconditionally; we keep the main-ring
+                // protection so `less`/`vim` cannot wipe the user's shell
+                // history.
+                if (mode == 3 and config.scrollback_lines > 0) {
+                    if (self.is_alt_screen) {
+                        if (self.alt_scrollback) |*sb| sb.clear();
+                    } else {
+                        self.scrollback.clear();
+                    }
                     self.view_offset = 0;
                 }
                 const total = @as(usize, self.cols) * @as(usize, self.rows);
@@ -1575,7 +1747,7 @@ test "Term: scrollUp(n) full-screen pushes n rows oldest first" {
     try testing.expectEqual(@as(u21, 'A'), term.scrollback.rowAt(2).cells[0].char);
 }
 
-test "Term: scrollUp on alt screen does NOT push" {
+test "Term: scrollUp on alt screen pushes to alt ring, not main" {
     if (config.scrollback_lines == 0) return error.SkipZigTest;
     var term = try Term.init(testing.allocator, 5, 3);
     defer term.deinit();
@@ -1583,18 +1755,86 @@ test "Term: scrollUp on alt screen does NOT push" {
     term.setCell(0, 0, .{ .char = 'A' });
     term.scroll_bottom = 2;
     term.scrollUp(1);
+    // Main ring untouched: alt-screen content never pollutes shell history.
     try testing.expectEqual(@as(u32, 0), term.scrollback.count);
+    // Alt ring captured the evicted row.
+    try testing.expect(term.alt_scrollback != null);
+    try testing.expectEqual(@as(u32, 1), term.alt_scrollback.?.count);
+    const v = term.alt_scrollback.?.rowAt(0);
+    try testing.expectEqual(@as(u21, 'A'), v.cells[0].char);
 }
 
-test "Term: scrollUp partial region (DECSTBM) does NOT push" {
+test "Term: scrollUp partial region touching top edge (top=0, bot<rows-1) pushes" {
     if (config.scrollback_lines == 0) return error.SkipZigTest;
     var term = try Term.init(testing.allocator, 5, 5);
     defer term.deinit();
     term.setCell(0, 1, .{ .char = 'A' });
+    // Header at row 0, content rows 1..3 (DECSTBM params are 1-indexed:
+    // ESC[1;4r → top=0, bot=3). bot+1=4 != rows=5, but top==0 → push.
+    term.scroll_top = 0;
+    term.scroll_bottom = 3;
+    term.scrollUp(1);
+    try testing.expectEqual(@as(u32, 1), term.scrollback.count);
+}
+
+test "Term: scrollUp partial region touching bottom edge (top>0, bot=rows-1) pushes" {
+    if (config.scrollback_lines == 0) return error.SkipZigTest;
+    var term = try Term.init(testing.allocator, 5, 5);
+    defer term.deinit();
+    term.setCell(0, 1, .{ .char = 'A' });
+    // Footer at last row, content rows 1..4 (ESC[2;5r → top=1, bot=4).
+    // top=1 != 0, but bot+1=5 == rows=5 → push.
+    term.scroll_top = 1;
+    term.scroll_bottom = 4;
+    term.scrollUp(1);
+    try testing.expectEqual(@as(u32, 1), term.scrollback.count);
+}
+
+test "Term: scrollUp floating partial region (top>0, bot<rows-1) does NOT push" {
+    if (config.scrollback_lines == 0) return error.SkipZigTest;
+    var term = try Term.init(testing.allocator, 5, 5);
+    defer term.deinit();
+    term.setCell(0, 1, .{ .char = 'A' });
+    // Floating mid-screen region (e.g. middle pane of a 3-pane tmux split).
+    // top=1 > 0 AND bot=3 < rows-1=4 → no edge touched → no push.
     term.scroll_top = 1;
     term.scroll_bottom = 3;
     term.scrollUp(1);
     try testing.expectEqual(@as(u32, 0), term.scrollback.count);
+}
+
+test "Term: codex-style main-screen TUI partial regions push scrollback" {
+    if (config.scrollback_lines == 0) return error.SkipZigTest;
+    // Regression coverage for codex-cli v0.142.1, which runs on the MAIN
+    // screen (no ?1049h) but uses partial DECSTBM regions for its
+    // header/content/footer layout. Captured sequences (rows=24):
+    //   ESC[1;7r   (top=0, bot=6)    — content above footer
+    //   ESC[8;24r  (top=7, bot=23)   — content below header
+    //   ESC[1;16r  (top=0, bot=15)   — content above footer
+    //   ESC[17;24r (top=16, bot=23)  — content below header
+    // All four touch at least one screen edge → all must push.
+    var term = try Term.init(testing.allocator, 5, 24);
+    defer term.deinit();
+
+    const regions = [_]struct { top: u32, bot: u32 }{
+        .{ .top = 0, .bot = 6 }, // ESC[1;7r
+        .{ .top = 7, .bot = 23 }, // ESC[8;24r
+        .{ .top = 0, .bot = 15 }, // ESC[1;16r
+        .{ .top = 16, .bot = 23 }, // ESC[17;24r
+    };
+
+    for (regions) |r| {
+        // Reset scrollback to isolate each region's push behaviour.
+        term.scrollback.clear();
+        term.view_offset = 0;
+        term.scroll_top = r.top;
+        term.scroll_bottom = r.bot;
+        // Plant a marker in the top row of the region so the eviction is
+        // observable.
+        term.setCell(0, r.top, .{ .char = 'X' });
+        term.scrollUp(1);
+        try testing.expect(term.scrollback.count > 0);
+    }
 }
 
 test "Term: switchScreen resets view_offset on enter and leave alt" {
@@ -1644,18 +1884,82 @@ test "Term: eraseDisplay 2 does NOT clear scrollback" {
     try testing.expectEqual(@as(u32, 1), term.scrollback.count);
 }
 
-test "Term: eraseDisplay 3 in alt screen leaves main scrollback intact" {
+test "Term: eraseDisplay 3 in alt screen clears alt ring, leaves main intact" {
     if (config.scrollback_lines == 0) return error.SkipZigTest;
     var term = try Term.init(testing.allocator, 3, 3);
     defer term.deinit();
+    // Stage main scrollback.
     term.setCell(0, 0, .{ .char = 'A' });
     term.scroll_bottom = 2;
     term.scrollUp(1);
     try testing.expectEqual(@as(u32, 1), term.scrollback.count);
 
+    // Enter alt, stage alt scrollback, fire ED 3 — must clear the alt ring
+    // only, leaving the main ring's history intact.
     try term.switchScreen(true);
+    term.setCell(0, 0, .{ .char = 'Z' });
+    term.scrollUp(1);
+    try testing.expectEqual(@as(u32, 1), term.alt_scrollback.?.count);
+
     term.eraseDisplay(3);
     try testing.expectEqual(@as(u32, 1), term.scrollback.count);
+    try testing.expectEqual(@as(u32, 0), term.alt_scrollback.?.count);
+    try testing.expectEqual(@as(u32, 0), term.view_offset);
+}
+
+test "Term: alt ring lifecycle — enter allocates, leave frees" {
+    if (config.scrollback_lines == 0) return error.SkipZigTest;
+    var term = try Term.init(testing.allocator, 3, 3);
+    defer term.deinit();
+    try testing.expect(term.alt_scrollback == null);
+
+    // Enter alt: ring is allocated with the configured capacity.
+    try term.switchScreen(true);
+    try testing.expect(term.alt_scrollback != null);
+    try testing.expectEqual(@as(u32, config.scrollback_lines), term.alt_scrollback.?.capacity);
+    try testing.expectEqual(@as(u32, 3), term.alt_scrollback.?.cols);
+    try testing.expectEqual(@as(u32, 0), term.alt_scrollback.?.count);
+
+    // Push a row so we can prove leave-alt drops it.
+    term.setCell(0, 0, .{ .char = 'Q' });
+    term.scroll_bottom = 2;
+    term.scrollUp(1);
+    try testing.expectEqual(@as(u32, 1), term.alt_scrollback.?.count);
+
+    // Leave alt: ring is freed and reset to null; main ring untouched.
+    try term.switchScreen(false);
+    try testing.expect(term.alt_scrollback == null);
+    try testing.expectEqual(@as(u32, 0), term.scrollback.count);
+    try testing.expectEqual(@as(u32, 0), term.view_offset);
+
+    // Re-enter alt: fresh ring, no leftover from previous session.
+    try term.switchScreen(true);
+    try testing.expect(term.alt_scrollback != null);
+    try testing.expectEqual(@as(u32, 0), term.alt_scrollback.?.count);
+}
+
+test "Term: scrollViewport navigates alt ring while in alt screen" {
+    if (config.scrollback_lines == 0) return error.SkipZigTest;
+    var term = try Term.init(testing.allocator, 3, 3);
+    defer term.deinit();
+    try term.switchScreen(true);
+    term.scroll_bottom = 2;
+    // Push 2 rows into the alt ring.
+    term.setCell(0, 0, .{ .char = 'A' });
+    term.scrollUp(1);
+    term.setCell(0, 0, .{ .char = 'B' });
+    term.scrollUp(1);
+    try testing.expectEqual(@as(u32, 2), term.alt_scrollback.?.count);
+
+    // scrollViewportUp/Down/ToTop/ToBottom operate on the alt ring.
+    term.scrollViewportUp(5); // clamp to count
+    try testing.expectEqual(@as(u32, 2), term.view_offset);
+    term.scrollViewportDown(1);
+    try testing.expectEqual(@as(u32, 1), term.view_offset);
+    term.scrollViewportToBottom();
+    try testing.expectEqual(@as(u32, 0), term.view_offset);
+    term.scrollViewportToTop();
+    try testing.expectEqual(@as(u32, 2), term.view_offset);
 }
 
 test "Term: scrollViewport helpers manipulate view_offset with clamps" {
@@ -1770,7 +2074,13 @@ test "Term: @sizeOf is unchanged when scrollback_lines == 0" {
     // hole — investigate before bumping. Updating the value is allowed
     // but should be a deliberate, isolated commit.
     if (config.scrollback_lines != 0) return error.SkipZigTest;
-    const EXPECTED: usize = 56296;
+    // Bumped from 56296 → 56560 when the per-session alt-screen scrollback
+    // ring (`alt_scrollback` field) was added. The field itself is `void`
+    // on the disabled path, but its declaration shifted the alignment
+    // layout of the surrounding alt-buffer fields (which DO contribute
+    // size on the disabled path) — net +264 bytes of padding. Verified
+    // by building with `-Dscrollback_lines=0` and recording the new size.
+    const EXPECTED: usize = 56560;
     try testing.expectEqual(EXPECTED, @sizeOf(Term));
 }
 

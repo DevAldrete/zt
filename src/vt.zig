@@ -2291,6 +2291,47 @@ test "Executor: DECSET 1049 switches to alt screen" {
     try testing.expectEqual(@as(u21, ' '), term.getCell(0, 0).char);
 }
 
+test "Executor: alt-screen output scrolls into alt ring (codex-style session)" {
+    // Comptime gate: `term.alt_scrollback` is `void` when scrollback is
+    // compiled out, and Zig type-checks the field access regardless of the
+    // runtime `if`. Use a comptime branch on the field's type so the dead
+    // branch is never semantically analysed.
+    if (@TypeOf(@as(Term, undefined).alt_scrollback) == void) return error.SkipZigTest;
+    var term = try Term.init(testing.allocator, 80, 3);
+    defer term.deinit();
+    var parser = Parser{};
+
+    // Enter alt screen — codex-cli style.
+    for ("\x1b[?1049h") |b| executeAction(parser.feed(b), &term);
+    try testing.expect(term.is_alt_screen);
+    try testing.expect(term.alt_scrollback != null);
+    try testing.expectEqual(@as(u32, 0), term.alt_scrollback.?.count);
+
+    // 3 lines printed into a 3-row screen, then one more CRLF. The LF at the
+    // end of "CCC\r\n" already sits on the bottom row and scrolls 'AAA' out;
+    // the trailing "\r\n" scrolls 'BBB' out. Two evictions, both into the alt
+    // ring; main ring stays empty.
+    for ("AAA\r\nBBB\r\nCCC\r\n\r\n") |b| executeAction(parser.feed(b), &term);
+
+    try testing.expectEqual(@as(u32, 2), term.alt_scrollback.?.count);
+    try testing.expectEqual(@as(u32, 0), term.scrollback.count);
+    // Newest evicted (age 0) = 'BBB', oldest (age 1) = 'AAA'.
+    try testing.expectEqual(@as(u21, 'B'), term.alt_scrollback.?.rowAt(0).cells[0].char);
+    try testing.expectEqual(@as(u21, 'A'), term.alt_scrollback.?.rowAt(1).cells[0].char);
+
+    // Shift+PgUp-style scrollViewport must navigate the alt ring.
+    term.scrollViewportUp(5); // clamps to count (2)
+    try testing.expectEqual(@as(u32, 2), term.view_offset);
+    term.scrollViewportToBottom();
+    try testing.expectEqual(@as(u32, 0), term.view_offset);
+
+    // Leave alt screen — alt ring is freed, main ring untouched.
+    for ("\x1b[?1049l") |b| executeAction(parser.feed(b), &term);
+    try testing.expect(!term.is_alt_screen);
+    try testing.expect(term.alt_scrollback == null);
+    try testing.expectEqual(@as(u32, 0), term.scrollback.count);
+}
+
 test "Executor: SGR 0 resets all attributes" {
     var term = try Term.init(testing.allocator, 80, 24);
     defer term.deinit();

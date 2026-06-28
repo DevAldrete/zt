@@ -153,8 +153,21 @@ The push runs BEFORE `bceMemset` clears the physical row (otherwise we'd push bl
 Erase paths that are NOT scrolls do NOT push:
 
 - `eraseDisplay 2` (`ED 2`) — clears viewport, scrollback preserved (matches st default).
-- `eraseDisplay 3` (`ED 3`) — clears scrollback **only when `!is_alt_screen`**. xterm clears unconditionally; we choose the safer "do not touch scrollback from inside `less`/`vim`" behaviour for v1. Easy to relax later.
-- `?1049` enter/exit — alt screen switch, no scrollback effect.
+- `eraseDisplay 3` (`ED 3`) — clears the **active** ring: main ring when on main screen, alt ring when on alt screen. xterm clears unconditionally; we keep the main-ring protection so `clear` issued from inside `less`/`vim` (alt screen) cannot wipe the user's shell history.
+- `?1049` enter/exit — alt screen switch; on enter-alt a per-session alt ring is allocated, on leave-alt it is freed. Alt-screen scrolls push into the alt ring (never the main ring).
+
+### 5.1 Scroll-region gating (edge-anchored rule)
+
+`shouldPushScrollback()` pushes when the current DECSTBM scroll region is anchored to **at least one screen edge** — `top == 0 OR bot+1 == rows`. This generalises the original "full-screen only" (`top==0 AND bot+1==rows`) rule to cover ratatui-style TUIs that run on the **main screen** with partial regions:
+
+| Region pattern | Example | top==0 | bot+1==rows | Push? |
+|----------------|---------|--------|-------------|-------|
+| Full screen | `ESC[1;24r` (rows=24) | ✓ | ✓ | ✓ |
+| Header + content | `ESC[8;24r` (codex) | ✗ | ✓ | ✓ |
+| Content + footer | `ESC[1;16r` (codex) | ✓ | ✗ | ✓ |
+| Floating mid-screen | `ESC[2;23r` (tmux middle pane) | ✗ | ✗ | ✗ |
+
+Excluded: only regions touching **neither** edge (middle pane of a 3+ pane tmux split). 2-pane tmux splits still push (one pane touches each edge), but tmux users rely on copy mode for scrollback, not the outer terminal's ring — the collateral is low-impact. This rule lets `codex-cli` (which runs on the main screen and uses `ESC[1;7r` / `ESC[8;24r` / `ESC[1;16r` / `ESC[17;24r` for header/content/footer) accumulate scrollback without any app-specific detection.
 
 ## 6. Render path
 
@@ -190,30 +203,67 @@ Added to `main.zig` key/wheel dispatch. Bindings live in `config.zig` constants 
 
 | Action | Binding | Notes |
 |--------|---------|-------|
-| Scroll up 3 lines | wheel up | Only when `mouse_mode == .none` AND `!is_alt_screen`. |
+| Scroll up 3 lines | wheel up | Only when `mouse_mode == .none` AND (`!is_alt_screen` OR `alt_screen_wheel_scrollback`). |
 | Scroll down 3 lines | wheel down | Same. |
-| Scroll up 1 page | Shift+PageUp | Active in main screen only (alt screen ignores). |
+| Scroll up 1 page | Shift+PageUp | Active on both screens; targets the active ring (main or alt). |
 | Scroll down 1 page | Shift+PageDown | Same. |
-| Jump to scrollback top | Shift+Home | Saturates at `scrollback.count`. |
+| Jump to scrollback top | Shift+Home | Saturates at `activeRing().count`. |
 | Jump to live tail | Shift+End | `view_offset = 0`. |
 | Jump to live tail (auto) | any keystroke that writes to PTY | Set `view_offset = 0` BEFORE the keystroke is processed. |
 
-Wheel routing has three cases (replacing the current `main.zig:826-829` handler):
+Wheel routing (replaces `main.zig` wheel handler):
 
-| `mouse_mode` | Screen | Wheel behaviour |
-|--------------|--------|-----------------|
-| `.none` | main | Scroll our scrollback. |
-| `.none` | alt | Translate to arrow keys (existing behaviour, keeps `less`/`man` working). |
-| non-`.none` | either | Forward as VT mouse event to the app (existing behaviour). |
+| `mouse_mode` | Screen | `alt_screen_wheel_scrollback` | Wheel behaviour |
+|--------------|--------|-------------------------------|-----------------|
+| `.none` | main | — | Scroll main ring. |
+| `.none` | alt | false (default) | Translate to arrow keys (keeps `less`/`man`/`nano`/`vim` working). |
+| `.none` | alt | true | Scroll alt ring (opt-in for `codex`-style sessions). |
+| non-`.none` | either | — | Forward as VT mouse event to the app. |
 
-In alt screen all scrollback-only bindings (Shift+PgUp/PgDn/Home/End) are inert — silently ignored. The buffer is paused there and showing "the old main" would surprise users.
+Shift+PgUp/PgDn/Home/End navigate the active ring on both screens. In alt
+screen they scroll the session-scoped alt ring, which holds the alt-screen
+output history — exactly what `codex` users need.
 
 ## 8. Alt-screen rules
 
-- On enter alt: `push_to_scrollback_disabled = true`, `view_offset = 0` (force live alt). Scrollback contents preserved.
-- On leave alt: `push_to_scrollback_disabled = false`, `view_offset = 0`.
-- During alt: `Term.scrollUp` skips the push step; existing alt-screen scrolling logic is untouched.
-- `?1049` save/restore is unchanged.
+The alt screen has its own session-scoped scrollback ring (separate from the
+main ring). Alt-screen content is captured into the alt ring while the alt
+screen is active; the main ring is never polluted by alt-screen output.
+
+- On enter alt: allocate a fresh alt ring sized `scrollback_lines × cols`.
+  Reset `view_offset = 0` (force live alt). Main ring contents preserved.
+- On leave alt: free the alt ring (`alt_scrollback = null`). Reset
+  `view_offset = 0`. This matches the existing "alt screen is ephemeral"
+  contract: quitting `less`/`vim`/`codex` drops the alt-screen history, and
+  the user returns to a clean main-screen view.
+- During alt: `Term.scrollUp` pushes evicted rows into the **alt ring** (not
+  the main ring). `shouldPushScrollback()` no longer gates on
+  `is_alt_screen`; instead `pushTarget()` routes to the active ring (main or
+  alt). `?1049` save/restore is unchanged.
+- `ED 3` (`eraseDisplay 3`) clears the **active** ring: the alt ring while
+  in alt screen, the main ring while on the main screen. xterm clears
+  unconditionally; we keep the main-ring protection so `clear` issued from
+  inside `less`/`vim` cannot wipe the user's shell history.
+
+### 8.1 Navigation in alt screen
+
+Shift+PgUp/PgDn/Home/End scroll the **active** ring (alt ring while in alt
+screen, main ring otherwise). These shifted keys are not captured by
+`codex`, `less`, `nano`, `vim`, or `tig`, so repurposing them for history
+browsing is safe in alt screen.
+
+The mouse wheel keeps its existing behaviour by default (translates to
+arrow keys when `mouse_mode == .none`), preserving `less`/`nano`/`vim` wheel
+compatibility. An opt-in build flag `-Dalt_screen_wheel_scrollback=true`
+(config `alt_screen_wheel_scrollback`) makes the wheel scroll the alt ring
+while in alt screen — useful for users running `codex` who do not need
+`less`/`nano` wheel compatibility in the same session.
+
+| Input | Main screen | Alt screen (default) | Alt screen (`alt_screen_wheel_scrollback=true`) |
+|-------|-------------|----------------------|------------------------------------------------|
+| Wheel (mouse_mode=.none) | scroll main ring | arrow keys | scroll alt ring |
+| Shift+PgUp/PgDn/Home/End | scroll main ring | scroll alt ring | scroll alt ring |
+| Wheel (mouse_mode!=.none) | forward to app | forward to app | forward to app |
 
 ## 9. Resize
 

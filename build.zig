@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         @panic("invalid -Dpty_buf_kb=0; expected a positive buffer size");
     }
     const scrollback_lines_opt = b.option(u32, "scrollback_lines", "Scrollback rows for main screen (0 disables, default 10000)") orelse 10000;
+    const alt_screen_wheel_scrollback_opt = b.option(bool, "alt_screen_wheel_scrollback", "Make the mouse wheel scroll the alt-screen scrollback ring instead of arrow keys (default: false)") orelse false;
     const shell_opt_raw = b.option([]const u8, "shell", "Shell path (default: /bin/sh)") orelse "/bin/sh";
     const shell_opt: [:0]const u8 = b.allocator.dupeZ(u8, shell_opt_raw) catch @panic("OOM");
 
@@ -80,6 +81,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(u32, "max_fps", max_fps_opt);
     options.addOption(u32, "pty_buf_kb", pty_buf_kb_opt);
     options.addOption(u32, "scrollback_lines", scrollback_lines_opt);
+    options.addOption(bool, "alt_screen_wheel_scrollback", alt_screen_wheel_scrollback_opt);
     options.addOption([:0]const u8, "shell", shell_opt);
     options.addOption([:0]const u8, "version", b.allocator.dupeZ(u8, "0.9.1") catch @panic("OOM"));
 

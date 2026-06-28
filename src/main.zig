@@ -273,6 +273,121 @@ fn setPtyWriteInterest(evloop_fd: i32, pty_fd: posix.fd_t, enabled: bool) void {
     }
 }
 
+/// Render the inline IME preedit (composition) overlay starting at the
+/// terminal cursor position. Called from the render loop on the live cursor
+/// row when `term.preedit_active` is true.
+///
+/// Each codepoint in `text` is decoded and drawn in its own cell. Wide (CJK)
+/// characters occupy two cells — the second cell is cleared to background so
+/// the wide glyph renders cleanly. Per-byte feedback flags from the IME are
+/// mapped to cell attributes:
+///   bit 0 (reverse)   → Cell.attrs.reverse
+///   bit 1 (underline)  → Cell.attrs.underline_style = single
+///   bit 2 (highlight)  → rendered as reverse (fcitx5 uses Highlight for the
+///                        selected candidate, which we display inverted)
+///
+/// The composition caret is drawn as a thin underline on the cell at the
+/// caret's byte offset, layered on top of the regular feedback styling.
+fn renderPreeditOverlay(
+    buf: []u8,
+    stride: u32,
+    start_x: u32,
+    cell_y: u32,
+    cols: u32,
+    text: []const u8,
+    caret_byte: u32,
+    feedback: *const [128]u8,
+) void {
+    if (text.len == 0 or start_x >= cols) return;
+
+    var x: u32 = start_x;
+    var byte_idx: usize = 0;
+    while (byte_idx < text.len and x < cols) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(text[byte_idx]) catch break;
+        if (byte_idx + cp_len > text.len) break;
+        const cp = std.unicode.utf8Decode(text[byte_idx .. byte_idx + cp_len]) catch break;
+        const fb = if (byte_idx < feedback.len) feedback[byte_idx] else 0;
+
+        // Determine cell width for this codepoint.
+        const wide = isWideCp(cp);
+        if (wide and x + 1 >= cols) break; // not enough room for wide char
+
+        // Build a Cell for rendering. Use default fg/bg (white on black) so
+        // the composition stands out against the terminal's current colors.
+        var cell = Cell{};
+        cell.char = cp;
+        cell.fg = config.default_fg;
+        cell.bg = config.default_bg;
+        // Apply feedback → attrs.
+        const reverse = (fb & 0x01) != 0 or (fb & 0x04) != 0; // Reverse or Highlight
+        if (reverse) cell.attrs.reverse = true;
+        if ((fb & 0x02) != 0) cell.attrs.underline_style = 1; // Underline
+        cell.attrs.wide = wide;
+
+        const glyph = FontType.getGlyph(cp);
+
+        // Clear the underlying cell first (wipe whatever was there), then
+        // draw the preedit glyph on top. We render with skip_bg=false so the
+        // background is always repainted, covering the previous content.
+        const fg_rgb: ?[3]u8 = null;
+        const bg_rgb: ?[3]u8 = null;
+        const ul_rgb: ?[3]u8 = null;
+        if (wide) {
+            render.renderCell(buf, stride, x, cell_y, cell, fg_rgb, bg_rgb, ul_rgb, glyph, config.font_width, config.font_height, .bgra32, true, config.scale, false);
+        } else {
+            render.renderCell(buf, stride, x, cell_y, cell, fg_rgb, bg_rgb, ul_rgb, glyph, config.font_width, config.font_height, .bgra32, false, config.scale, false);
+        }
+
+        // Composition caret: draw an underline on the cell that contains the
+        // caret byte offset. This layers on top of any feedback underline.
+        if (byte_idx == caret_byte or (byte_idx < caret_byte and byte_idx + cp_len > caret_byte)) {
+            // Re-render with a double underline to distinguish the caret.
+            var caret_cell = cell;
+            caret_cell.attrs.underline_style = 2; // double underline = caret
+            if (wide) {
+                render.renderCell(buf, stride, x, cell_y, caret_cell, fg_rgb, bg_rgb, ul_rgb, glyph, config.font_width, config.font_height, .bgra32, true, config.scale, false);
+            } else {
+                render.renderCell(buf, stride, x, cell_y, caret_cell, fg_rgb, bg_rgb, ul_rgb, glyph, config.font_width, config.font_height, .bgra32, false, config.scale, false);
+            }
+        }
+
+        if (wide and x + 1 < cols) {
+            // Wide char: renderCell with wide=true already fills 2 cells worth
+            // of background (scaled_w = font_w*2*scale) and draws the 16px
+            // glyph bitmap from the first cell's pixel origin. The second cell
+            // does NOT need a separate renderCell call — doing so would
+            // overwrite the right half of the glyph with background, producing
+            // the "only left half visible" symptom.
+            x += 2;
+        } else {
+            x += 1;
+        }
+        byte_idx += cp_len;
+    }
+}
+
+/// East Asian Width check for preedit rendering. Mirrors vt.zig's isWide but
+/// is duplicated here to keep the render path decoupled from the VT layer.
+/// Only the common CJK ranges are covered — sufficient for IME composition
+/// text which is overwhelmingly Hiragana/Katakana/Kanji/Hangul.
+fn isWideCp(cp: u21) bool {
+    if (cp < 0x1100) return false;
+    if (cp <= 0x115F) return true; // Hangul Jamo
+    if (cp >= 0x2E80 and cp <= 0x303E) return true; // CJK Radicals, CJK Symbols
+    if (cp >= 0x3041 and cp <= 0x33BF) return true; // Hiragana, Katakana, Bopomofo, Hangul Compat, CJK Strokes
+    if (cp >= 0x33C0 and cp <= 0x33FF) return true; // CJK Compatibility
+    if (cp >= 0x3400 and cp <= 0x4DBF) return true; // CJK Extension A
+    if (cp >= 0x4E00 and cp <= 0xA4CF) return true; // CJK Unified through Yi
+    if (cp >= 0xAC00 and cp <= 0xD7A3) return true; // Hangul Syllables
+    if (cp >= 0xF900 and cp <= 0xFAFF) return true; // CJK Compatibility Ideographs
+    if (cp >= 0xFE30 and cp <= 0xFE6F) return true; // CJK Compatibility Forms
+    if (cp >= 0xFF01 and cp <= 0xFF60) return true; // Fullwidth Forms
+    if (cp >= 0xFFE0 and cp <= 0xFFE6) return true; // Fullwidth Signs
+    if (cp >= 0x1F300 and cp <= 0x1FAFF) return true; // Emoji / Supplemental Symbols
+    if (cp >= 0x20000 and cp <= 0x3FFFF) return true; // CJK Extensions B-H+
+    return false;
+}
+
 /// Write to PTY with buffering on WouldBlock.
 /// The pending queue is dynamic so large pastes or VT responses are not truncated.
 fn ptyBufferedWrite(
@@ -575,10 +690,14 @@ fn handleBackendEvent(
             refreshCursorBlinkOnUserInput(cursor_visible_blink, cursor_blink_active, last_input_ns);
             if (!key_ev.pressed) return true;
 
-            // Scrollback shortcuts — main screen only, scrollback enabled,
-            // shift modifier carves out a user override that does not collide
-            // with PageUp/Home/End sequences apps may want.
-            if (config.scrollback_lines > 0 and !term.is_alt_screen and key_ev.modifiers.shift) {
+            // Scrollback shortcuts — active on both main and alt screen
+            // (scrollback enabled). The shift modifier carves out a user
+            // override that does not collide with PageUp/Home/End sequences
+            // apps may want; Shift+PgUp/PgDn/Home/End are not captured by
+            // common TUI apps (less/vim/nano/codex), so repurposing them for
+            // history browsing is safe. The active ring (main vs alt) is
+            // chosen inside the scrollViewport* helpers.
+            if (config.scrollback_lines > 0 and key_ev.modifiers.shift) {
                 const handled = switch (key_ev.keycode) {
                     input.KEY.PAGEUP => blk: {
                         const page: u32 = if (term.rows > 1) term.rows - 1 else 1;
@@ -628,6 +747,14 @@ fn handleBackendEvent(
                     return false;
                 }
             }
+        },
+        .preedit => |preedit_ev| {
+            // IME composition update — purely a renderer-side concern. The
+            // preedit text is NOT sent to the PTY; it's only displayed inline
+            // until the IME commits (which arrives as a separate .text event).
+            const text = preedit_ev.slice();
+            const fb = preedit_ev.feedback[0..preedit_ev.len];
+            term.setPreedit(text, preedit_ev.caret, fb, preedit_ev.active);
         },
         .paste => |paste_ev| {
             refreshCursorBlinkOnUserInput(cursor_visible_blink, cursor_blink_active, last_input_ns);
@@ -741,7 +868,12 @@ fn handleBackendEvent(
                     return true;
                 }
                 // 2) Main screen with scrollback enabled → scroll history.
-                if (config.scrollback_lines > 0 and !term.is_alt_screen) {
+                //    Alt screen with scrollback enabled AND the opt-in
+                //    `alt_screen_wheel_scrollback` config flag → also scroll
+                //    history (the per-session alt ring). Default false keeps
+                //    the wheel translating to arrow keys for `less`/`nano`/
+                //    `vim` running in alt screen without mouse tracking.
+                if (config.scrollback_lines > 0 and (!term.is_alt_screen or config.alt_screen_wheel_scrollback)) {
                     if (up) {
                         term.scrollViewportUp(config.scrollback_wheel_lines);
                     } else {
@@ -1653,12 +1785,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var row_ul: []const ?[3]u8 = undefined;
             var row_hl: []const u16 = undefined;
             if (sb_age) |age| {
-                const v = term.scrollback.rowAt(age);
-                row_cells = v.cells;
-                row_fg = v.fg_rgb;
-                row_bg = v.bg_rgb;
-                row_ul = v.ul_color_rgb;
-                row_hl = v.hyperlink_ids;
+                // Pull from the active ring (main or per-session alt). When the
+                // alt ring is missing (OOM on enter-alt, or compiled out) we
+                // must never get here because view_offset would have been
+                // clamped to 0; guard defensively by snapping back to the live
+                // tail and falling through to the live-grid path below.
+                if (term.activeRing()) |ring| {
+                    const v = ring.rowAt(age);
+                    row_cells = v.cells;
+                    row_fg = v.fg_rgb;
+                    row_bg = v.bg_rgb;
+                    row_ul = v.ul_color_rgb;
+                    row_hl = v.hyperlink_ids;
+                } else {
+                    // Defensive: no ring available but view_offset > 0. Snap
+                    // back and treat as a live row at this y.
+                    term.view_offset = 0;
+                    const phys_row = term.row_map[y];
+                    const row_base = @as(usize, phys_row) * @as(usize, term.cols);
+                    row_cells = term.cells[row_base..][0..term.cols];
+                    row_fg = term.fg_rgb[row_base..][0..term.cols];
+                    row_bg = term.bg_rgb[row_base..][0..term.cols];
+                    row_ul = term.ul_color_rgb[row_base..][0..term.cols];
+                    row_hl = term.hyperlink_ids[row_base..][0..term.cols];
+                }
             } else {
                 const phys_row = term.row_map[live_y];
                 const row_base = @as(usize, phys_row) * @as(usize, term.cols);
@@ -1688,7 +1838,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const glyph = if (cell.char == ' ' or cell.char == 0) null else FontType.getGlyph(cell.char);
                 const vis = term.cursor_visible and cursor_visible_blink;
                 // Cursor lives on the live grid; hide it while rendering scrollback rows.
-                const is_cursor = vis and sb_age == null and term.cursor_y == live_y and (term.cursor_x == x or
+                // Hide the block cursor while an IME preedit is active on this row —
+                // the composition overlay takes its place and drawing both would
+                // produce double-inverted noise.
+                const cursor_hidden_by_preedit = term.preedit_active and sb_age == null and term.cursor_y == live_y;
+                const is_cursor = vis and !cursor_hidden_by_preedit and sb_age == null and term.cursor_y == live_y and (term.cursor_x == x or
                     (cell.attrs.wide and x + 1 < term.cols and term.cursor_x == x + 1));
 
                 var render_cell = cell.*;
@@ -1737,6 +1891,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             // Mark dirty once per row instead of per cell
             if (!all_dirty) backend.markDirtyRows(y * config.cell_height, (y + 1) * config.cell_height - 1);
+
+            // Inline IME preedit overlay: draw the composition text starting
+            // at the cursor position on the live cursor row. Each glyph is
+            // rendered with its feedback style (reverse/underline/highlight).
+            // Wide CJK chars consume two cells; the cursor is hidden while
+            // preedit is active (handled above via cursor_hidden_by_preedit).
+            if (term.preedit_active and sb_age == null and term.cursor_y == live_y) {
+                renderPreeditOverlay(
+                    buf,
+                    stride,
+                    term.cursor_x,
+                    y,
+                    term.cols,
+                    term.preedit_text[0..term.preedit_len],
+                    term.preedit_caret,
+                    &term.preedit_feedback,
+                );
+            }
         }
         term.clearDirty();
         last_render_ns = posix.nanoTimestamp();
@@ -1763,4 +1935,5 @@ test {
     _ = @import("input.zig");
     _ = @import("render.zig");
     _ = @import("scrollback.zig");
+    if (config.backend == .x11) _ = @import("backend/x11.zig");
 }

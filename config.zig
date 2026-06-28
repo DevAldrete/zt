@@ -46,5 +46,12 @@ pub const scrollback_lines: u32 = build_options.scrollback_lines;
 /// Lines scrolled per mouse-wheel notch.
 pub const scrollback_wheel_lines: u32 = 3;
 
+/// When true, the mouse wheel scrolls the alt-screen scrollback ring while
+/// in alt screen (instead of translating to arrow keys). Opt-in: enables
+/// wheel-driven history browsing inside apps like `codex` that enter alt
+/// screen without enabling mouse tracking. Default false preserves
+/// `less`/`nano`/`vim` wheel-as-arrow behaviour.
+pub const alt_screen_wheel_scrollback: bool = build_options.alt_screen_wheel_scrollback;
+
 pub const shell: [:0]const u8 = std.mem.span(@as([*:0]const u8, build_options.shell));
 pub const version: [:0]const u8 = std.mem.span(@as([*:0]const u8, build_options.version));
