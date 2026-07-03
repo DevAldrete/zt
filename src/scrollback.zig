@@ -21,6 +21,11 @@ pub const Scrollback = struct {
     head: u32 = 0,
     count: u32 = 0,
 
+    // Big per-cell planes are NOT zero-initialized: a slot is only readable
+    // after pushRow wrote it (rowAt gates on `count`), and the color/hyperlink
+    // planes of a slot are only read when its has_truecolor/has_hyperlink
+    // flag is set — i.e. when pushRow copied them. Untouched pages stay
+    // non-resident, so a fresh ring costs ~0 RSS.
     cells: []Cell,
     fg_rgb: []?[3]u8,
     bg_rgb: []?[3]u8,
@@ -28,6 +33,11 @@ pub const Scrollback = struct {
     hyperlink_ids: []u16,
     used_cols: []u16,
     has_truecolor: []bool,
+    has_hyperlink: []bool,
+    // Shared all-blank metadata row (cols wide) returned by rowAt for slots
+    // whose planes were never written.
+    zero_rgb: []?[3]u8,
+    zero_hl: []u16,
 
     const Self = @This();
 
@@ -49,14 +59,20 @@ pub const Scrollback = struct {
         const uc = try allocator.alloc(u16, capacity);
         errdefer allocator.free(uc);
         const tc = try allocator.alloc(bool, capacity);
+        errdefer allocator.free(tc);
+        const hf = try allocator.alloc(bool, capacity);
+        errdefer allocator.free(hf);
+        const z_rgb = try allocator.alloc(?[3]u8, cols);
+        errdefer allocator.free(z_rgb);
+        const z_hl = try allocator.alloc(u16, cols);
 
-        @memset(cells, Cell{});
-        @memset(fg, null);
-        @memset(bg, null);
-        @memset(ul, null);
-        @memset(hl, 0);
+        // Only the small capacity/cols-sized arrays are initialized; the big
+        // per-cell planes stay untouched (see field comment).
         @memset(uc, 0);
         @memset(tc, false);
+        @memset(hf, false);
+        @memset(z_rgb, null);
+        @memset(z_hl, 0);
 
         return .{
             .allocator = allocator,
@@ -69,6 +85,9 @@ pub const Scrollback = struct {
             .hyperlink_ids = hl,
             .used_cols = uc,
             .has_truecolor = tc,
+            .has_hyperlink = hf,
+            .zero_rgb = z_rgb,
+            .zero_hl = z_hl,
         };
     }
 
@@ -80,6 +99,9 @@ pub const Scrollback = struct {
         self.allocator.free(self.hyperlink_ids);
         self.allocator.free(self.used_cols);
         self.allocator.free(self.has_truecolor);
+        self.allocator.free(self.has_hyperlink);
+        self.allocator.free(self.zero_rgb);
+        self.allocator.free(self.zero_hl);
     }
 
     pub fn clear(self: *Self) void {
@@ -87,6 +109,10 @@ pub const Scrollback = struct {
         self.count = 0;
     }
 
+    /// `may_have_rgb` / `may_have_hl` are conservative caller hints (from the
+    /// terminal's screen-wide has_truecolor_cells / has_ul_hl_cells flags):
+    /// when false the corresponding src planes are known all-blank, so both
+    /// the scan and the copy are skipped and rowAt serves the shared zero row.
     pub fn pushRow(
         self: *Self,
         src_cells: []const Cell,
@@ -94,6 +120,8 @@ pub const Scrollback = struct {
         src_bg: []const ?[3]u8,
         src_ul: []const ?[3]u8,
         src_hl: []const u16,
+        may_have_rgb: bool,
+        may_have_hl: bool,
     ) void {
         std.debug.assert(src_cells.len == self.cols);
         std.debug.assert(src_fg.len == self.cols);
@@ -104,46 +132,72 @@ pub const Scrollback = struct {
         const slot = self.head;
         const start: usize = @as(usize, slot) * @as(usize, self.cols);
         @memcpy(self.cells[start .. start + self.cols], src_cells);
-        @memcpy(self.fg_rgb[start .. start + self.cols], src_fg);
-        @memcpy(self.bg_rgb[start .. start + self.cols], src_bg);
-        @memcpy(self.ul_color_rgb[start .. start + self.cols], src_ul);
-        @memcpy(self.hyperlink_ids[start .. start + self.cols], src_hl);
 
-        // Per-row truecolor scan
+        // Per-row truecolor scan (fg/bg/ul); copy those planes only when the
+        // row actually carries color metadata.
         var has_tc = false;
-        for (src_fg) |v| {
-            if (v != null) {
-                has_tc = true;
-                break;
-            }
-        }
-        if (!has_tc) {
-            for (src_bg) |v| {
+        if (may_have_rgb) {
+            for (src_fg) |v| {
                 if (v != null) {
                     has_tc = true;
                     break;
                 }
             }
-        }
-        if (!has_tc) {
-            for (src_ul) |v| {
-                if (v != null) {
-                    has_tc = true;
-                    break;
+            if (!has_tc) {
+                for (src_bg) |v| {
+                    if (v != null) {
+                        has_tc = true;
+                        break;
+                    }
                 }
             }
+            if (!has_tc) {
+                for (src_ul) |v| {
+                    if (v != null) {
+                        has_tc = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (has_tc) {
+            @memcpy(self.fg_rgb[start .. start + self.cols], src_fg);
+            @memcpy(self.bg_rgb[start .. start + self.cols], src_bg);
+            @memcpy(self.ul_color_rgb[start .. start + self.cols], src_ul);
         }
         self.has_truecolor[slot] = has_tc;
+
+        var has_hl = false;
+        if (may_have_hl) {
+            for (src_hl) |v| {
+                if (v != 0) {
+                    has_hl = true;
+                    break;
+                }
+            }
+        }
+        if (has_hl) {
+            @memcpy(self.hyperlink_ids[start .. start + self.cols], src_hl);
+        }
+        self.has_hyperlink[slot] = has_hl;
 
         // Compute used_cols: trim trailing default blanks for resize accuracy.
         // A "default blank" is char==' ' and no per-cell metadata override.
         var uc: u32 = self.cols;
-        while (uc > 0) {
-            const i = uc - 1;
-            const c = src_cells[i];
-            if (c.char != ' ' or src_fg[i] != null or src_bg[i] != null or
-                src_ul[i] != null or src_hl[i] != 0) break;
-            uc -= 1;
+        if (has_tc or has_hl) {
+            while (uc > 0) {
+                const i = uc - 1;
+                const c = src_cells[i];
+                if (c.char != ' ' or src_fg[i] != null or src_bg[i] != null or
+                    src_ul[i] != null or src_hl[i] != 0) break;
+                uc -= 1;
+            }
+        } else {
+            // Metadata planes are all blank — only the glyphs matter.
+            while (uc > 0) {
+                if (src_cells[uc - 1].char != ' ') break;
+                uc -= 1;
+            }
         }
         self.used_cols[slot] = @intCast(uc);
 
@@ -166,23 +220,39 @@ pub const Scrollback = struct {
         const new_ul = try self.allocator.alloc(?[3]u8, new_total);
         errdefer self.allocator.free(new_ul);
         const new_hl = try self.allocator.alloc(u16, new_total);
+        errdefer self.allocator.free(new_hl);
+        const new_z_rgb = try self.allocator.alloc(?[3]u8, new_cols);
+        errdefer self.allocator.free(new_z_rgb);
+        const new_z_hl = try self.allocator.alloc(u16, new_cols);
 
-        @memset(new_cells, Cell{});
-        @memset(new_fg, null);
-        @memset(new_bg, null);
-        @memset(new_ul, null);
-        @memset(new_hl, 0);
+        @memset(new_z_rgb, null);
+        @memset(new_z_hl, 0);
 
+        // Migrate only the occupied slots — unoccupied slots are never read
+        // (rowAt gates on count), and plane rows without metadata are never
+        // read either (rowAt serves the zero row), so neither needs init.
         const copy_cols: usize = @min(self.cols, new_cols);
-        var slot: u32 = 0;
-        while (slot < self.capacity) : (slot += 1) {
+        var i: u32 = 0;
+        while (i < self.count) : (i += 1) {
+            const slot: u32 = @intCast((@as(u64, self.head) + self.capacity - self.count + i) % self.capacity);
             const old_start: usize = @as(usize, slot) * @as(usize, self.cols);
             const new_start: usize = @as(usize, slot) * @as(usize, new_cols);
             @memcpy(new_cells[new_start .. new_start + copy_cols], self.cells[old_start .. old_start + copy_cols]);
-            @memcpy(new_fg[new_start .. new_start + copy_cols], self.fg_rgb[old_start .. old_start + copy_cols]);
-            @memcpy(new_bg[new_start .. new_start + copy_cols], self.bg_rgb[old_start .. old_start + copy_cols]);
-            @memcpy(new_ul[new_start .. new_start + copy_cols], self.ul_color_rgb[old_start .. old_start + copy_cols]);
-            @memcpy(new_hl[new_start .. new_start + copy_cols], self.hyperlink_ids[old_start .. old_start + copy_cols]);
+            if (new_cols > copy_cols) @memset(new_cells[new_start + copy_cols .. new_start + new_cols], Cell{});
+            if (self.has_truecolor[slot]) {
+                @memcpy(new_fg[new_start .. new_start + copy_cols], self.fg_rgb[old_start .. old_start + copy_cols]);
+                @memcpy(new_bg[new_start .. new_start + copy_cols], self.bg_rgb[old_start .. old_start + copy_cols]);
+                @memcpy(new_ul[new_start .. new_start + copy_cols], self.ul_color_rgb[old_start .. old_start + copy_cols]);
+                if (new_cols > copy_cols) {
+                    @memset(new_fg[new_start + copy_cols .. new_start + new_cols], null);
+                    @memset(new_bg[new_start + copy_cols .. new_start + new_cols], null);
+                    @memset(new_ul[new_start + copy_cols .. new_start + new_cols], null);
+                }
+            }
+            if (self.has_hyperlink[slot]) {
+                @memcpy(new_hl[new_start .. new_start + copy_cols], self.hyperlink_ids[old_start .. old_start + copy_cols]);
+                if (new_cols > copy_cols) @memset(new_hl[new_start + copy_cols .. new_start + new_cols], 0);
+            }
 
             // Wide-char boundary fix: a wide-left glyph stranded at the new
             // last column has its right half (the wide_dummy) dropped — blank
@@ -191,10 +261,12 @@ pub const Scrollback = struct {
                 const last = new_start + copy_cols - 1;
                 if (new_cells[last].attrs.wide) {
                     new_cells[last] = .{};
-                    new_fg[last] = null;
-                    new_bg[last] = null;
-                    new_ul[last] = null;
-                    new_hl[last] = 0;
+                    if (self.has_truecolor[slot]) {
+                        new_fg[last] = null;
+                        new_bg[last] = null;
+                        new_ul[last] = null;
+                    }
+                    if (self.has_hyperlink[slot]) new_hl[last] = 0;
                 }
             }
 
@@ -207,12 +279,16 @@ pub const Scrollback = struct {
         self.allocator.free(self.bg_rgb);
         self.allocator.free(self.ul_color_rgb);
         self.allocator.free(self.hyperlink_ids);
+        self.allocator.free(self.zero_rgb);
+        self.allocator.free(self.zero_hl);
 
         self.cells = new_cells;
         self.fg_rgb = new_fg;
         self.bg_rgb = new_bg;
         self.ul_color_rgb = new_ul;
         self.hyperlink_ids = new_hl;
+        self.zero_rgb = new_z_rgb;
+        self.zero_hl = new_z_hl;
         self.cols = new_cols;
     }
 
@@ -226,14 +302,17 @@ pub const Scrollback = struct {
         const slot: u32 = @intCast(@mod(idx_i, cap_i));
         const start: usize = @as(usize, slot) * @as(usize, self.cols);
         const end = start + self.cols;
+        const has_tc = self.has_truecolor[slot];
         return .{
             .cells = self.cells[start..end],
-            .fg_rgb = self.fg_rgb[start..end],
-            .bg_rgb = self.bg_rgb[start..end],
-            .ul_color_rgb = self.ul_color_rgb[start..end],
-            .hyperlink_ids = self.hyperlink_ids[start..end],
+            // Slots without color/hyperlink metadata never had their planes
+            // written — serve the shared zero row instead.
+            .fg_rgb = if (has_tc) self.fg_rgb[start..end] else self.zero_rgb[0..self.cols],
+            .bg_rgb = if (has_tc) self.bg_rgb[start..end] else self.zero_rgb[0..self.cols],
+            .ul_color_rgb = if (has_tc) self.ul_color_rgb[start..end] else self.zero_rgb[0..self.cols],
+            .hyperlink_ids = if (self.has_hyperlink[slot]) self.hyperlink_ids[start..end] else self.zero_hl[0..self.cols],
             .used_cols = self.used_cols[slot],
-            .has_truecolor = self.has_truecolor[slot],
+            .has_truecolor = has_tc,
         };
     }
 };
@@ -268,7 +347,7 @@ test "Scrollback: pushRow stores cells and rowAt(0) returns newest" {
     const empty_rgb = [_]?[3]u8{null} ** 5;
     const empty_hl = [_]u16{0} ** 5;
 
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
 
     try testing.expectEqual(@as(u32, 1), sb.count);
     const view = sb.rowAt(0);
@@ -289,7 +368,7 @@ test "Scrollback: pushRow trims trailing default blanks for used_cols" {
     const empty_rgb = [_]?[3]u8{null} ** 6;
     const empty_hl = [_]u16{0} ** 6;
 
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
     try testing.expectEqual(@as(u16, 3), sb.rowAt(0).used_cols);
 }
 
@@ -303,19 +382,19 @@ test "Scrollback: pushRow detects truecolor in fg/bg/ul" {
 
     var fg = [_]?[3]u8{null} ** 3;
     fg[1] = .{ 200, 100, 50 };
-    sb.pushRow(&cells, &fg, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &fg, &empty_rgb, &empty_rgb, &empty_hl, true, true);
     try testing.expectEqual(true, sb.rowAt(0).has_truecolor);
 
     sb.clear();
     var bg = [_]?[3]u8{null} ** 3;
     bg[2] = .{ 0, 0, 1 };
-    sb.pushRow(&cells, &empty_rgb, &bg, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &bg, &empty_rgb, &empty_hl, true, true);
     try testing.expectEqual(true, sb.rowAt(0).has_truecolor);
 
     sb.clear();
     var u = [_]?[3]u8{null} ** 3;
     u[0] = .{ 9, 9, 9 };
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &u, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &u, &empty_hl, true, true);
     try testing.expectEqual(true, sb.rowAt(0).has_truecolor);
 }
 
@@ -327,7 +406,7 @@ test "Scrollback: capacity overflow drops oldest" {
     const empty_hl = [_]u16{0};
     inline for (0..5) |i| {
         const cells = [_]Cell{.{ .char = 'A' + @as(u8, i) }};
-        sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+        sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
     }
 
     try testing.expectEqual(@as(u32, 3), sb.count);
@@ -343,7 +422,7 @@ test "Scrollback: rowAt clamps age to count-1" {
     const cells = [_]Cell{.{ .char = 'A' }};
     const empty_rgb = [_]?[3]u8{null};
     const empty_hl = [_]u16{0};
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
 
     // Asking for an age beyond count returns the oldest available row
     // rather than panicking — defensive contract for callers.
@@ -361,7 +440,7 @@ test "Scrollback: resize shrinks rows and preserves leading content" {
     };
     const empty_rgb = [_]?[3]u8{null} ** 5;
     const empty_hl = [_]u16{0} ** 5;
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
 
     try sb.resize(3);
     try testing.expectEqual(@as(u32, 3), sb.cols);
@@ -379,7 +458,7 @@ test "Scrollback: resize grows rows and pads with blanks" {
     const cells = [_]Cell{ .{ .char = 'X' }, .{ .char = 'Y' }, .{ .char = 'Z' } };
     const empty_rgb = [_]?[3]u8{null} ** 3;
     const empty_hl = [_]u16{0} ** 3;
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
 
     try sb.resize(6);
     try testing.expectEqual(@as(u32, 6), sb.cols);
@@ -403,7 +482,7 @@ test "Scrollback: resize fixes wide-char left half stranded at new last column" 
     };
     const empty_rgb = [_]?[3]u8{null} ** 4;
     const empty_hl = [_]u16{0} ** 4;
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
 
     // Shrink to 2 cols — the wide char's right half (col 2) is dropped, so
     // the wide left half at col 1 must be replaced with blank.
@@ -421,7 +500,7 @@ test "Scrollback: resize is no-op when new_cols == old_cols" {
     const cells = [_]Cell{ .{ .char = 'A' }, .{ .char = 'B' }, .{ .char = 'C' }, .{ .char = 'D' } };
     const empty_rgb = [_]?[3]u8{null} ** 4;
     const empty_hl = [_]u16{0} ** 4;
-    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl);
+    sb.pushRow(&cells, &empty_rgb, &empty_rgb, &empty_rgb, &empty_hl, true, true);
 
     try sb.resize(4);
     const v = sb.rowAt(0);

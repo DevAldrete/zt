@@ -655,6 +655,10 @@ pub const Term = struct {
             self.bg_rgb[start..][0..self.cols],
             self.ul_color_rgb[start..][0..self.cols],
             self.hyperlink_ids[start..][0..self.cols],
+            // Screen-wide lazy-plane flags: when clear, the planes are known
+            // all-blank and pushRow skips both the scan and the copy.
+            self.has_truecolor_cells or self.has_ul_hl_cells,
+            self.has_ul_hl_cells,
         );
     }
 
