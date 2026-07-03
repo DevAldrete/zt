@@ -917,6 +917,18 @@ pub const Term = struct {
                         @memcpy(nhl[new_start .. new_start + alt_copy_cols], ohl[old_start .. old_start + alt_copy_cols]);
                     };
                 }
+                // Same wide-pair truncation repair as the active grid above —
+                // without it the stashed screen surfaces a headless/orphaned
+                // pair when the user switches back (e.g. 1049l after resize).
+                if (new_cols < old_alt_cols) {
+                    const ablank = Cell{};
+                    for (0..alt_copy_rows) |ay| {
+                        const last = ay * @as(usize, new_cols) + new_cols - 1;
+                        if (nac[last].attrs.wide) nac[last] = ablank;
+                        const first = ay * @as(usize, new_cols);
+                        if (nac[first].attrs.wide_dummy) nac[first] = ablank;
+                    }
+                }
             }
         }
 
@@ -1192,6 +1204,41 @@ pub const Term = struct {
             @memset(self.ul_color_rgb[phys_start..phys_end], null);
             @memset(self.hyperlink_ids[phys_start..phys_end], 0);
         }
+    }
+
+    /// Wide-pair invariant violation report (see findWideViolation).
+    pub const WideViolation = struct { x: u32, y: u32, reason: []const u8 };
+
+    /// Scan the live grid for broken wide-char pairs. The invariant every
+    /// mutation path must preserve:
+    ///   cell.wide       ⇒ x+1 < cols and cell(x+1).wide_dummy
+    ///   cell.wide_dummy ⇒ x > 0 and cell(x-1).wide
+    /// Test-only diagnostic — the chronic wide-char bug class (25 fix
+    /// commits) is exactly these invariants breaking on some mutation path.
+    pub fn findWideViolation(self: *const Self) ?WideViolation {
+        var y: u32 = 0;
+        while (y < self.rows) : (y += 1) {
+            const row_base = @as(usize, self.row_map[y]) * @as(usize, self.cols);
+            var x: u32 = 0;
+            while (x < self.cols) : (x += 1) {
+                const a = self.cells[row_base + x].attrs;
+                if (a.wide and a.wide_dummy)
+                    return .{ .x = x, .y = y, .reason = "cell is both wide and wide_dummy" };
+                if (a.wide) {
+                    if (x + 1 >= self.cols)
+                        return .{ .x = x, .y = y, .reason = "wide head in last column" };
+                    if (!self.cells[row_base + x + 1].attrs.wide_dummy)
+                        return .{ .x = x, .y = y, .reason = "wide head without dummy at x+1" };
+                }
+                if (a.wide_dummy) {
+                    if (x == 0)
+                        return .{ .x = x, .y = y, .reason = "wide_dummy in column 0" };
+                    if (!self.cells[row_base + x - 1].attrs.wide)
+                        return .{ .x = x, .y = y, .reason = "orphan wide_dummy (no head at x-1)" };
+                }
+            }
+        }
+        return null;
     }
 
     /// Fix wide character boundaries at the edges of an erase/delete range.
@@ -1482,7 +1529,16 @@ pub const Term = struct {
         const row_base = phys * cols;
         const logical_row_start = @as(usize, self.cursor_y) * cols;
 
-        self.fixWideBoundaries(logical_row_start + cx, logical_row_start + cx + count);
+        // Insert semantics: [cx, cx+count) becomes a blank gap and existing
+        // content shifts right — pairs inside the shifted block stay intact,
+        // so fixWideBoundaries (erase semantics) would wrongly split the
+        // pair straddling cx+count. The only pair actually split here is
+        // one straddling cx itself: its head stays put, its dummy shifts.
+        if (self.cells[row_base + cx].attrs.wide_dummy and cx > 0) {
+            const blank = self.blankCell();
+            self.setCell(@intCast(cx - 1), self.cursor_y, blank); // orphaned head
+            self.setCell(@intCast(cx), self.cursor_y, blank); // dummy would shift as garbage
+        }
 
         const copy_len = remaining - count;
         if (copy_len > 0) {
@@ -1495,6 +1551,12 @@ pub const Term = struct {
 
         // Clear inserted characters with BCE
         self.bceMemset(row_base + cx, row_base + cx + count);
+
+        // The right shift can land a wide head in the last column with its
+        // dummy pushed off the row — clear the now-unpaired head.
+        if (self.cells[row_base + cols - 1].attrs.wide) {
+            self.cells[row_base + cols - 1] = self.blankCell();
+        }
 
         self.markDirtyRange(.{ .start = logical_row_start + cx, .end = logical_row_start + cols });
     }

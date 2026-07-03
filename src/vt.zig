@@ -3313,3 +3313,74 @@ test "Window title: only first sanitized title stored when two OSC sequences sen
     const stored = term.title[0..term.title_len];
     try testing.expectEqualSlices(u8, "Second", stored);
 }
+
+test "Storm: wide-char pair invariants survive random mutation soup" {
+    // Deterministic fuzz over the real parser/executor: mixed narrow/wide
+    // text + every row/region mutation (ICH/DCH/ECH/EL/ED/IL/DL/SU/SD/RI,
+    // DECSTBM, CUP, alt screen, resize). After every op the wide-pair
+    // invariants must hold (term.findWideViolation). A violation prints the
+    // op index for replay — bump `ops` locally when hunting a regression.
+    for ([_]u64{ 0xDEADBEEF, 1, 42, 0xC0FFEE, 987654321 }) |seed| {
+        try stormRun(seed);
+    }
+}
+
+fn stormRun(seed: u64) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    var term = try Term.init(testing.allocator, 11, 6);
+    defer term.deinit();
+    var parser = Parser{};
+
+    const wide_chars = [_][]const u8{ "\xe3\x81\x82", "\xe6\xbc\xa2", "\xef\xbc\xa1" }; // あ 漢 Ａ
+    var buf: [32]u8 = undefined;
+    const ops: usize = 100000;
+    var i: usize = 0;
+    while (i < ops) : (i += 1) {
+        const seq: []const u8 = switch (rand.uintLessThan(u8, 18)) {
+            0, 1, 2, 3 => blk: { // narrow char
+                buf[0] = 'a' + rand.uintLessThan(u8, 26);
+                break :blk buf[0..1];
+            },
+            4, 5, 6, 7 => wide_chars[rand.uintLessThan(usize, wide_chars.len)],
+            8 => std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ rand.uintLessThan(u8, 8) + 1, rand.uintLessThan(u8, 13) + 1 }) catch unreachable, // CUP (may exceed dims)
+            9 => std.fmt.bufPrint(&buf, "\x1b[{d}@", .{rand.uintLessThan(u8, 6) + 1}) catch unreachable, // ICH
+            10 => std.fmt.bufPrint(&buf, "\x1b[{d}P", .{rand.uintLessThan(u8, 6) + 1}) catch unreachable, // DCH
+            11 => std.fmt.bufPrint(&buf, "\x1b[{d}X", .{rand.uintLessThan(u8, 6) + 1}) catch unreachable, // ECH
+            12 => std.fmt.bufPrint(&buf, "\x1b[{d}K", .{rand.uintLessThan(u8, 3)}) catch unreachable, // EL 0-2
+            13 => std.fmt.bufPrint(&buf, "\x1b[{d}J", .{rand.uintLessThan(u8, 3)}) catch unreachable, // ED 0-2
+            14 => std.fmt.bufPrint(&buf, "\x1b[{d}{c}", .{ rand.uintLessThan(u8, 4) + 1, @as(u8, if (rand.boolean()) 'L' else 'M') }) catch unreachable, // IL/DL
+            15 => std.fmt.bufPrint(&buf, "\x1b[{d}{c}", .{ rand.uintLessThan(u8, 4) + 1, @as(u8, if (rand.boolean()) 'S' else 'T') }) catch unreachable, // SU/SD
+            16 => switch (rand.uintLessThan(u8, 4)) {
+                0 => "\x1b[3;5r", // DECSTBM
+                1 => "\x1b[r",
+                2 => "\x1bM", // RI
+                else => "\x1bD", // IND
+            },
+            else => if (rand.boolean()) "\x1b[?1049h" else "\x1b[?1049l", // alt screen
+        };
+        for (seq) |byte| {
+            const action = parser.feed(byte);
+            executeAction(action, &term);
+        }
+        // Occasional resize wobble
+        if (i % 977 == 0) {
+            const nc = 6 + rand.uintLessThan(u32, 10);
+            const nr = 3 + rand.uintLessThan(u32, 6);
+            term.resize(nc, nr) catch {};
+        }
+        if (term.findWideViolation()) |v| {
+            std.debug.print("WIDE INVARIANT BROKEN op={d} ({d},{d}): {s} — last seq bytes: {any}\n", .{ i, v.x, v.y, v.reason, seq });
+            std.debug.print("cols={d} rows={d} cursor=({d},{d}) alt={}\n", .{ term.cols, term.rows, term.cursor_x, term.cursor_y, term.is_alt_screen });
+            const rb = @as(usize, term.row_map[v.y]) * @as(usize, term.cols);
+            var xx: u32 = 0;
+            while (xx < term.cols) : (xx += 1) {
+                const a = term.cells[rb + xx].attrs;
+                const c: u8 = if (a.wide) 'W' else if (a.wide_dummy) 'd' else '.';
+                std.debug.print("{c}", .{c});
+            }
+            std.debug.print("\n", .{});
+            return error.WideInvariantBroken;
+        }
+    }
+}
