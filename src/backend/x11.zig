@@ -71,7 +71,8 @@ pub const TextEvent = struct {
 };
 
 /// Shared pre-edit event shape for the main dispatcher.
-/// X11 currently uses XIMPreeditNothing, so this backend does not emit it.
+/// Emitted via XIMPreeditCallbacks (preedit_draw/caret/done) when the IM
+/// supports on-the-spot preedit; falls back to XIMPreeditNothing otherwise.
 pub const PreeditEvent = struct {
     data: [128]u8 = undefined,
     len: u32 = 0,
@@ -138,6 +139,9 @@ pub const X11Backend = struct {
     xim_active: bool = false,
     committed_text: TextEvent = .{},
     has_committed: bool = false,
+    preedit: PreeditEvent = .{},
+    has_preedit: bool = false,
+    tried_preedit_callbacks: bool = false, // for fallback to PreeditNothing
     forwarded_keycode: u8 = 0, // XCB keycode (detail) from forward_event callback
     forwarded_mods: input_mod.Modifiers = .{}, // modifiers from forwarded key
     has_forwarded_key: bool = false,
@@ -560,10 +564,10 @@ pub const X11Backend = struct {
                 .forward_event = forwardEventCallback,
                 .commit_string = commitStringCallback,
                 .geometry = null,
-                .preedit_start = null,
-                .preedit_draw = null,
-                .preedit_caret = null,
-                .preedit_done = null,
+                .preedit_start = preeditStartCallback,
+                .preedit_draw = preeditDrawCallback,
+                .preedit_caret = preeditCaretCallback,
+                .preedit_done = preeditDoneCallback,
                 .status_start = null,
                 .status_draw_text = null,
                 .status_draw_bitmap = null,
@@ -582,9 +586,12 @@ pub const X11Backend = struct {
         const self: *Self = @ptrCast(@alignCast(user_data));
         self.xim_connected = true;
 
-        // XIMPreeditNothing (0x0008): IM handles preedit display in its own
-        // popup window. XNSpotLocation tells the IM where to position it.
-        const input_style: u32 = 0x0008 | 0x0400; // XIMPreeditNothing | XIMStatusNothing
+        // Prefer XIMPreeditCallbacks (0x0002): we render the preedit inline
+        // (same as the Wayland backend). If IC creation fails, retry with
+        // XIMPreeditNothing (0x0008) where the IM draws its own popup.
+        // XNSpotLocation positions the candidate window in both styles.
+        self.tried_preedit_callbacks = true;
+        const input_style: u32 = 0x0002 | 0x0400; // XIMPreeditCallbacks | XIMStatusNothing
         var spot = c.xcb_point_t{ .x = 0, .y = 0 };
         var nested = c.xcb_xim_create_nested_list(xim, c.XCB_XIM_XNSpotLocation, &spot, @as(?*anyopaque, null));
         defer std.c.free(nested.data);
@@ -604,14 +611,143 @@ pub const X11Backend = struct {
         );
     }
 
-    fn ximCreateIcCallback(_: ?*c.xcb_xim_t, ic: c.xcb_xic_t, user_data: ?*anyopaque) callconv(.c) void {
+    fn ximCreateIcCallback(xim_opt: ?*c.xcb_xim_t, ic: c.xcb_xic_t, user_data: ?*anyopaque) callconv(.c) void {
         const self: *Self = @ptrCast(@alignCast(user_data));
+        if (ic == 0 and self.tried_preedit_callbacks) {
+            // IM rejected XIMPreeditCallbacks — retry with XIMPreeditNothing
+            self.tried_preedit_callbacks = false;
+            const input_style: u32 = 0x0008 | 0x0400;
+            var spot = c.xcb_point_t{ .x = 0, .y = 0 };
+            var nested = c.xcb_xim_create_nested_list(xim_opt, c.XCB_XIM_XNSpotLocation, &spot, @as(?*anyopaque, null));
+            defer std.c.free(nested.data);
+            _ = c.xcb_xim_create_ic(
+                xim_opt,
+                ximCreateIcCallback,
+                user_data,
+                c.XCB_XIM_XNInputStyle,
+                &input_style,
+                c.XCB_XIM_XNClientWindow,
+                &self.window,
+                c.XCB_XIM_XNFocusWindow,
+                &self.window,
+                c.XCB_XIM_XNPreeditAttributes,
+                &nested,
+                @as(?*anyopaque, null),
+            );
+            return;
+        }
         self.xic = ic;
         if (ic != 0) {
             if (self.xim) |xim| {
                 _ = c.xcb_xim_set_ic_focus(xim, ic);
             }
         }
+    }
+
+    /// Strip ISO 2022 Compound Text UTF-8 wrappers (ESC % G ... ESC % @)
+    /// that some IMs leave around UTF-8 payloads.
+    fn stripCtWrappers(data_in: []u8) []u8 {
+        var data = data_in;
+        if (data.len >= 3 and data[0] == 0x1b and data[1] == 0x25 and data[2] == 0x47) {
+            data = data[3..];
+        }
+        if (data.len >= 3 and data[data.len - 3] == 0x1b and data[data.len - 2] == 0x25 and data[data.len - 1] == 0x40) {
+            data = data[0 .. data.len - 3];
+        }
+        return data;
+    }
+
+    /// Byte offset of the `char_idx`-th UTF-8 character in `data`.
+    fn utf8CharToByte(data: []const u8, char_idx: u32) u32 {
+        var chars: u32 = 0;
+        var i: u32 = 0;
+        while (i < data.len and chars < char_idx) {
+            // Count only non-continuation bytes
+            i += 1;
+            while (i < data.len and (data[i] & 0xC0) == 0x80) i += 1;
+            chars += 1;
+        }
+        return i;
+    }
+
+    fn preeditStartCallback(_: ?*c.xcb_xim_t, _: c.xcb_xic_t, user_data: ?*anyopaque) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(user_data));
+        self.preedit = .{ .active = true };
+    }
+
+    fn preeditDrawCallback(
+        _: ?*c.xcb_xim_t,
+        _: c.xcb_xic_t,
+        frame: ?*c.xcb_im_preedit_draw_fr_t,
+        user_data: ?*anyopaque,
+    ) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(user_data));
+        const fr = frame orelse return;
+        var p = &self.preedit;
+
+        // Splice: replace chars [chg_first, chg_first+chg_length) with the
+        // new string. Indices are in characters; our buffer is UTF-8 bytes.
+        const old = p.data[0..p.len];
+        const start_b = utf8CharToByte(old, fr.chg_first);
+        const end_b = start_b + utf8CharToByte(old[start_b..], fr.chg_length);
+
+        var ins: []u8 = &.{};
+        // status bit 0x1 = no string (deletion only)
+        if ((fr.status & 0x1) == 0 and fr.length_of_preedit_string > 0) {
+            ins = stripCtWrappers(fr.preedit_string[0..fr.length_of_preedit_string]);
+        }
+
+        var buf: [128]u8 = undefined;
+        var n: u32 = 0;
+        const tail = old[@min(end_b, p.len)..];
+        for ([_][]const u8{ old[0..start_b], ins, tail }) |part| {
+            const take: u32 = @intCast(@min(part.len, buf.len - n));
+            @memcpy(buf[n .. n + take], part[0..take]);
+            n += take;
+        }
+        @memcpy(p.data[0..n], buf[0..n]);
+        p.len = n;
+
+        // Feedback: XIM sends per-character u32 flags for the inserted range
+        // (XIMReverse=1, XIMUnderline=2, XIMHighlight=4 — same bit layout as
+        // PreeditEvent's per-byte flags). Expand each char flag to its bytes.
+        // ponytail: feedback outside the changed range is reset to 0 rather
+        // than spliced; fcitx5/ibus always redraw the full string anyway.
+        @memset(p.feedback[0..128], 0);
+        if ((fr.status & 0x2) == 0 and fr.feedback_array.size > 0) {
+            var bi: u32 = start_b;
+            var ci: u32 = 0;
+            while (bi < n and ci < fr.feedback_array.size) : (ci += 1) {
+                const flags: u8 = @truncate(fr.feedback_array.items[ci] & 0x7);
+                p.feedback[bi] = flags;
+                bi += 1;
+                while (bi < n and (p.data[bi] & 0xC0) == 0x80) : (bi += 1) {
+                    p.feedback[bi] = flags;
+                }
+            }
+        }
+
+        p.caret = utf8CharToByte(p.data[0..p.len], fr.caret);
+        p.active = p.len > 0;
+        self.has_preedit = true;
+    }
+
+    fn preeditCaretCallback(
+        _: ?*c.xcb_xim_t,
+        _: c.xcb_xic_t,
+        frame: ?*c.xcb_im_preedit_caret_fr_t,
+        user_data: ?*anyopaque,
+    ) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(user_data));
+        const fr = frame orelse return;
+        self.preedit.caret = utf8CharToByte(self.preedit.slice(), fr.position);
+        self.has_preedit = true;
+    }
+
+    fn preeditDoneCallback(_: ?*c.xcb_xim_t, _: c.xcb_xic_t, user_data: ?*anyopaque) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(user_data));
+        self.preedit = .{ .active = false, .len = 0 };
+        self.has_preedit = true;
     }
 
     fn commitStringCallback(
@@ -625,17 +761,7 @@ pub const X11Backend = struct {
         user_data: ?*anyopaque,
     ) callconv(.c) void {
         const self: *Self = @ptrCast(@alignCast(user_data));
-        var data = str[0..length];
-
-        // Strip ISO 2022 Compound Text wrappers if present
-        // ESC % G (switch to UTF-8) = 1b 25 47
-        if (data.len >= 3 and data[0] == 0x1b and data[1] == 0x25 and data[2] == 0x47) {
-            data = data[3..];
-        }
-        // ESC % @ (switch back to Latin-1) = 1b 25 40
-        if (data.len >= 3 and data[data.len - 3] == 0x1b and data[data.len - 2] == 0x25 and data[data.len - 1] == 0x40) {
-            data = data[0 .. data.len - 3];
-        }
+        const data = stripCtWrappers(str[0..length]);
 
         const len = @min(data.len, 128);
         @memcpy(self.committed_text.data[0..len], data[0..len]);
@@ -927,6 +1053,34 @@ pub const X11Backend = struct {
         self.stride = new_stride;
     }
 
+    /// Drain one pending event produced by XIM callbacks (commit text,
+    /// forwarded key, or preedit update), honoring suppress_xim_result.
+    fn takeXimEvent(self: *Self) ?Event {
+        if (self.has_committed) {
+            self.has_committed = false;
+            if (self.suppress_xim_result) {
+                self.suppress_xim_result = false;
+            } else {
+                return .{ .text = self.committed_text };
+            }
+        }
+        if (self.has_forwarded_key) {
+            self.has_forwarded_key = false;
+            if (self.suppress_xim_result) {
+                self.suppress_xim_result = false;
+            } else {
+                return self.processKeycode(self.forwarded_keycode, self.forwarded_mods);
+            }
+        }
+        if (self.has_preedit) {
+            self.has_preedit = false;
+            // Never suppressed: even during IME toggle, a preedit clear must
+            // reach the renderer to wipe a stale overlay.
+            return .{ .preedit = self.preedit };
+        }
+        return null;
+    }
+
     pub fn pollEvents(self: *Self) ?Event {
         // Check for X connection errors (embedded parent destroyed, etc.)
         if (c.xcb_connection_has_error(self.connection) != 0) {
@@ -956,22 +1110,7 @@ pub const X11Backend = struct {
         }
 
         // First, check if XIM callbacks produced events.
-        if (self.has_committed) {
-            self.has_committed = false;
-            if (self.suppress_xim_result) {
-                self.suppress_xim_result = false;
-            } else {
-                return .{ .text = self.committed_text };
-            }
-        }
-        if (self.has_forwarded_key) {
-            self.has_forwarded_key = false;
-            if (self.suppress_xim_result) {
-                self.suppress_xim_result = false;
-            } else {
-                return self.processKeycode(self.forwarded_keycode, self.forwarded_mods);
-            }
-        }
+        if (self.takeXimEvent()) |ev| return ev;
 
         // Loop until we find a handled event or the queue is empty.
         // Unhandled event types (ReparentNotify, MapNotify, etc.) are skipped
@@ -990,23 +1129,8 @@ pub const X11Backend = struct {
             // because xcb-imdkit uses this to process the XIM protocol handshake
             if (self.xim) |xim| {
                 if (shouldFilterXimEvent(event_type, self.xic) and c.xcb_xim_filter_event(xim, event)) {
-                    // XIM consumed the event — check if it produced committed text
-                    if (self.has_committed) {
-                        self.has_committed = false;
-                        if (self.suppress_xim_result) {
-                            self.suppress_xim_result = false;
-                        } else {
-                            return .{ .text = self.committed_text };
-                        }
-                    }
-                    if (self.has_forwarded_key) {
-                        self.has_forwarded_key = false;
-                        if (self.suppress_xim_result) {
-                            self.suppress_xim_result = false;
-                        } else {
-                            return self.processKeycode(self.forwarded_keycode, self.forwarded_mods);
-                        }
-                    }
+                    // XIM consumed the event — check if it produced text/preedit
+                    if (self.takeXimEvent()) |ev| return ev;
                     continue; // XIM consumed event but produced nothing, try next
                 }
             }
@@ -1090,20 +1214,7 @@ pub const X11Backend = struct {
                                 // leaving has_pending_xim stuck true indefinitely.
                                 _ = c.xcb_flush(self.connection);
                                 // Check if forwarding produced immediate results
-                                if (self.has_committed) {
-                                    self.has_committed = false;
-                                    if (!self.suppress_xim_result) {
-                                        return .{ .text = self.committed_text };
-                                    }
-                                    self.suppress_xim_result = false;
-                                }
-                                if (self.has_forwarded_key) {
-                                    self.has_forwarded_key = false;
-                                    if (!self.suppress_xim_result) {
-                                        return self.processKeycode(self.forwarded_keycode, self.forwarded_mods);
-                                    }
-                                    self.suppress_xim_result = false;
-                                }
+                                if (self.takeXimEvent()) |ev| return ev;
                                 // Continue draining XCB event queue — do NOT return null here.
                                 // xcb_poll_for_event may have buffered multiple events from
                                 // a single socket read; returning null would exit the caller's
