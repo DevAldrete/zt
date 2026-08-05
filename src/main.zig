@@ -97,7 +97,9 @@ fn setupSignals() !posix.fd_t {
         _ = std.c.sigprocmask(std.c.SIG.BLOCK, &mask, null);
         // SIGPIPE: ignore globally so bad writes return EPIPE
         // instead of terminating the process.
-        _ = std.c.signal(std.c.SIG.PIPE, std.c.SIG.IGN);
+        var sigact = std.mem.zeroes(std.posix.Sigaction);
+        sigact.handler = .{ .handler = std.c.SIG.IGN };
+        std.posix.sigaction(std.c.SIG.PIPE, &sigact, null);
         return -1;
     }
 }
@@ -183,9 +185,9 @@ fn kqueueAddFd(kq: i32, fd: posix.fd_t, tag: usize) !void {
     _ = try posix.kevent(kq, &changelist, &.{}, null);
 }
 
-fn kqueueAddSignal(kq: i32, sig: u6) !void {
+fn kqueueAddSignal(kq: i32, sig: anytype) !void {
     const changelist = [1]posix.Kevent{.{
-        .ident = sig,
+        .ident = @intCast(@intFromEnum(sig)),
         .filter = std.c.EVFILT.SIGNAL,
         .flags = std.c.EV.ADD,
         .fflags = 0,

@@ -342,7 +342,7 @@ pub const Pty = struct {
                     reaped = true;
                     break;
                 }
-                if (std.c.getErrno(rc) == .CHILD) {
+                if (std.c.errno(rc) == .CHILD) {
                     reaped = true;
                     break;
                 }
@@ -409,11 +409,27 @@ test "Pty: exec argv builder keeps all arguments" {
 }
 
 test "Pty: spawn and read echo output" {
-    // Skip when /dev/ptmx (Linux) is missing or invisible (e.g. restricted CI/sandbox).
-    var pty = Pty.spawn(80, 24, "/bin/echo", null) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => |e| return e,
-    };
+    if (is_linux) {
+        // Skip when /dev/ptmx (Linux) is missing or invisible (e.g. restricted CI/sandbox).
+        var pty = Pty.spawn(80, 24, "/bin/echo", null) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => |e| return e,
+        };
+        defer pty.deinit();
+
+        // Wait for output
+        posix.sleep(100 * std.time.ns_per_ms);
+
+        var buf: [256]u8 = undefined;
+        const n = pty.read(&buf) catch 0;
+        // echo with no args outputs "\r\n" or "\n"
+        try testing.expect(n > 0);
+        return;
+    }
+
+    // macOS: /bin/echo always exists and Pty.spawn's error set doesn't
+    // (and never needs to) include FileNotFound, so no skip path here.
+    var pty = Pty.spawn(80, 24, "/bin/echo", null) catch |e| return e;
     defer pty.deinit();
 
     // Wait for output

@@ -213,12 +213,33 @@ fn msgSend_insertText(target: id, _sel: SEL, text: id, repRange: NSRange) void {
 pub const Event = union(enum) {
     key: KeyEvent,
     text: TextEvent,
+    preedit: PreeditEvent,
     paste: PasteEvent,
     resize: ResizeEvent,
     expose: void,
     close: void,
     focus_in: void,
     focus_out: void,
+    mouse: MouseEvent,
+    copy_selection: void,
+};
+
+// Shared with main.zig — keep in sync with x11.zig / wayland.zig. The macOS
+// backend does not currently emit preedit events (NSTextInputClient marks
+// composition via setMarkedText, which only toggles has_marked_text), but
+// main.zig requires the type to exist for its backend-agnostic dispatch.
+pub const PreeditEvent = struct {
+    data: [128]u8 = undefined,
+    len: u32 = 0,
+    caret: u32 = 0,
+    active: bool = false,
+    // Per-byte feedback flags, indexed in lockstep with `data`.
+    // Bit 0 = reverse, Bit 1 = underline, Bit 2 = highlight.
+    feedback: [128]u8 = [_]u8{0} ** 128,
+
+    pub fn slice(self: *const PreeditEvent) []const u8 {
+        return self.data[0..self.len];
+    }
 };
 
 pub const PasteEvent = struct {
@@ -249,6 +270,34 @@ pub const KeyEvent = struct {
 pub const ResizeEvent = struct {
     width: u32,
     height: u32,
+};
+
+// Shared with main.zig — keep in sync with x11.zig / wayland.zig. The macOS
+// backend does not currently synthesize mouse events, but main.zig requires
+// the type to exist for its backend-agnostic mouse dispatch.
+pub const MouseEvent = struct {
+    x: u32, // pixel x
+    y: u32, // pixel y
+    button: Button,
+    action: Action,
+    modifiers: input_mod.Modifiers,
+
+    pub const Button = enum(u3) {
+        left = 0,
+        middle = 1,
+        right = 2,
+        none = 3,
+        wheel_up = 4,
+        wheel_down = 5,
+        wheel_left = 6,
+        wheel_right = 7,
+    };
+
+    pub const Action = enum(u2) {
+        press,
+        release,
+        motion,
+    };
 };
 
 // =============================================================================
