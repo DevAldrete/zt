@@ -658,6 +658,11 @@ fn registerZTViewClass() ?id {
 
     // --- NSTextInputClient ---
     _ = class_addMethod(new_class, sel("insertText:replacementRange:"), @ptrCast(@constCast(&ztInsertText)), "v@:@{_NSRange=QQ}");
+    // Legacy NSResponder informal method. interpretKeyEvents: dispatches
+    // plain character keys through the key-binding mechanism, which calls
+    // the single-argument insertText: (not the NSTextInputClient variant).
+    // Route it to the shared handler with an empty replacement range.
+    _ = class_addMethod(new_class, sel("insertText:"), @ptrCast(@constCast(&ztInsertTextLegacy)), "v@:@");
     _ = class_addMethod(new_class, sel("hasMarkedText"), @ptrCast(@constCast(&ztHasMarkedText)), "c@:");
     _ = class_addMethod(new_class, sel("setMarkedText:selectedRange:replacementRange:"), @ptrCast(@constCast(&ztSetMarkedText)), "v@:@{_NSRange=QQ}{_NSRange=QQ}");
     _ = class_addMethod(new_class, sel("unmarkText"), @ptrCast(@constCast(&ztUnmarkText)), "v@:");
@@ -856,12 +861,12 @@ fn ztInsertText(self_view: id, _: SEL, text_obj: id, _: NSRange) callconv(.c) vo
     const len = std.mem.len(cstr);
     if (len == 0) return;
 
-    // Skip all single-byte ASCII — these are already handled by the key
-    // event path (macosToEvdev → translateKey). Without this guard, keys
-    // like Enter (0x0D) and Tab (0x09) produce duplicates: one from the
-    // key event and one from insertText. Only let through multi-byte
-    // sequences (IME-composed text, dead key output, etc.).
-    if (len == 1 and cstr[0] < 0x80) return;
+    // Note: do NOT filter single-byte ASCII here. Text-producing keys
+    // (letters, digits, space, punctuation) never reach this point as
+    // KeyEvents — keyDown: forwards them straight to interpretKeyEvents:
+    // → insertText:. Special keys (Enter, Tab, arrows, F-keys) and Ctrl/
+    // Alt combos are handled in keyDown: and return before reaching the
+    // IME path, so there is no duplication to guard against here.
 
     var text_event: TextEvent = .{};
     const copy_len = @min(len, text_event.data.len);
@@ -870,6 +875,12 @@ fn ztInsertText(self_view: id, _: SEL, text_obj: id, _: NSRange) callconv(.c) vo
     backend.pushEvent(.{ .text = text_event });
 
     backend.has_marked_text = false;
+}
+
+/// Legacy single-argument insertText: (NSResponder informal method) — see
+/// the class-registration comment. Forward to the shared handler.
+fn ztInsertTextLegacy(self_view: id, _: SEL, text_obj: id) callconv(.c) void {
+    ztInsertText(self_view, undefined, text_obj, .{ .location = 0x7FFFFFFFFFFFFFFF, .length = 0 });
 }
 
 fn ztHasMarkedText(self_view: id, _: SEL) callconv(.c) BOOL {

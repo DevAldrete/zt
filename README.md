@@ -12,12 +12,6 @@ Originally built for the [HackberryPi Zero](https://github.com/ZitaoTech/Hackber
 
 > **Note:** This is an experimental project. It works well enough for daily use with common CLI tools, but it is not a full-featured terminal. See [Limitations](#limitations) for what's missing.
 
-## Benchmarks
-
-![zt performance comparison](docs/benchmark.png)
-
-Measured on Intel i5-12450H, 1 CPU core, X11 (:0, hardware GPU), `-Doptimize=ReleaseFast`. See [zt-bench](https://github.com/midasdf/zt-bench) for methodology, detailed results, and how to reproduce.
-
 ## Features
 
 ### Rendering
@@ -66,6 +60,9 @@ zig build -Dbackend=x11 -Doptimize=ReleaseFast
 # Wayland
 zig build -Dbackend=wayland -Doptimize=ReleaseFast
 
+# Macos
+zig build -Dbackend=macos -Doptimize=ReleaseFast
+
 # Framebuffer (bare Linux console, no X/Wayland)
 zig build -Doptimize=ReleaseSmall
 
@@ -105,9 +102,6 @@ zig build -Dbackend=x11 -Dfont=path/to/myfont.ttf -Doptimize=ReleaseFast
 
 # Cross-compile for aarch64
 zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSmall
-
-# macOS (experimental, untested — see note below)
-zig build -Dbackend=macos -Dshell=/bin/zsh -Doptimize=ReleaseFast
 
 # Run tests
 zig build test
