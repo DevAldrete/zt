@@ -40,6 +40,8 @@ Originally built for the [HackberryPi Zero](https://github.com/ZitaoTech/Hackber
 - **Row-map scroll** — O(1) scroll via row indirection instead of copying cells
 - **Lazy metadata planes** — TrueColor, underline-color and hyperlink arrays are only written while those features are in use
 - **Damage tracking** — per-cell dirty flag, row-level skip
+- **Zero idle wakeups** — the cursor-blink timer is disarmed once idle; an idle Linux terminal blocks indefinitely in epoll_wait
+- **Shrinking SHM** — Wayland buffers release memfd memory when the window shrinks (no high-water retention)
 - **Comptime configuration** — backend, font, palette, scale resolved at compile time
 
 ## Build
@@ -70,7 +72,7 @@ zig build -Doptimize=ReleaseSmall
 ./zig-out/bin/zt
 ```
 
-Add `-Dstrip=true` to remove debug symbols.
+Release builds strip debug info and symbols by default (`-Dstrip=false` to keep them).
 
 ### More Options
 
@@ -84,8 +86,8 @@ zig build -Dbackend=x11 -Dshell=/bin/fish -Doptimize=ReleaseFast
 # 60fps cap (battery saving)
 zig build -Dbackend=x11 -Dmax_fps=60 -Doptimize=ReleaseFast
 
-# Smaller PTY buffer (conserve memory)
-zig build -Dbackend=x11 -Dpty_buf_kb=256 -Doptimize=ReleaseSmall
+# PTY read buffer size (default 256KB, tune for memory vs. burst throughput)
+zig build -Dbackend=x11 -Dpty_buf_kb=64 -Doptimize=ReleaseSmall
 
 # Disable scrollback (smaller binary, no scroll history)
 zig build -Dbackend=x11 -Dscrollback_lines=0 -Doptimize=ReleaseFast

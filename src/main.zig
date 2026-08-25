@@ -128,6 +128,43 @@ fn createTimerFd(interval_ns: u64) !posix.fd_t {
     }
 }
 
+const CURSOR_BLINK_NS: u64 = 500_000_000;
+
+/// (Re-)arm the cursor-blink timer. Called on user input and focus-in so the
+/// blink resumes after the idle-timeout disarmed it. No-op when the timer is
+/// already armed, so frequent input events (mouse motion, held keys) do not
+/// pay a timerfd_settime/kevent syscall each time.
+fn armCursorBlinkTimer(evloop_fd: i32, timer_fd: posix.fd_t, armed: *bool) void {
+    if (armed.*) return;
+    armed.* = true;
+    if (is_linux) {
+        if (timer_fd < 0) return;
+        const sec: isize = @intCast(CURSOR_BLINK_NS / std.time.ns_per_s);
+        const nsec: isize = @intCast(CURSOR_BLINK_NS % std.time.ns_per_s);
+        const ts = linux.timespec{ .sec = sec, .nsec = nsec };
+        const spec = linux.itimerspec{ .it_interval = ts, .it_value = ts };
+        _ = linux.timerfd_settime(timer_fd, .{}, &spec, null);
+    } else {
+        kqueueSetTimerEnabled(evloop_fd, KQUEUE_TIMER_IDENT, true);
+    }
+}
+
+/// Disarm the cursor-blink timer once the idle timeout has frozen the blink.
+/// Without this the 500 ms timerfd fires forever (2 wakeups/sec idle) even
+/// though `applyCursorBlinkTimerTick` is a no-op after idle.
+fn disarmCursorBlinkTimer(evloop_fd: i32, timer_fd: posix.fd_t, armed: *bool) void {
+    if (!armed.*) return;
+    armed.* = false;
+    if (is_linux) {
+        if (timer_fd < 0) return;
+        const zero_ts = linux.timespec{ .sec = 0, .nsec = 0 };
+        const spec = linux.itimerspec{ .it_interval = zero_ts, .it_value = zero_ts };
+        _ = linux.timerfd_settime(timer_fd, .{}, &spec, null);
+    } else {
+        kqueueSetTimerEnabled(evloop_fd, KQUEUE_TIMER_IDENT, false);
+    }
+}
+
 // =============================================================================
 // Epoll helpers
 // =============================================================================
@@ -221,6 +258,21 @@ fn kqueueSetPtyWrite(kq: i32, pty_fd: posix.fd_t, enable: bool) void {
     }};
     _ = posix.kevent(kq, &changelist, &.{}, null) catch |err| {
         std.log.debug("kqueueSetPtyWrite failed: {}", .{err});
+    };
+}
+
+fn kqueueSetTimerEnabled(kq: i32, ident: usize, enable: bool) void {
+    const flags: u16 = if (enable) std.c.EV.ENABLE else std.c.EV.DISABLE;
+    const changelist = [1]posix.Kevent{.{
+        .ident = ident,
+        .filter = std.c.EVFILT.TIMER,
+        .flags = flags,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    _ = posix.kevent(kq, &changelist, &.{}, null) catch |err| {
+        std.log.debug("kqueueSetTimerEnabled failed: {}", .{err});
     };
 }
 
@@ -487,7 +539,11 @@ test "PtyWriteQueue head offset keeps data intact across discard and append" {
 }
 
 /// Reset cursor blink idle tracking on user input (all backend dispatch paths use handleBackendEvent).
+/// Re-arms the blink timer if it was disarmed by the idle timeout.
 fn refreshCursorBlinkOnUserInput(
+    evloop_fd: i32,
+    timer_fd: posix.fd_t,
+    blink_timer_armed: *bool,
     cursor_visible_blink: *bool,
     cursor_blink_active: *bool,
     last_input_ns: *i128,
@@ -495,6 +551,7 @@ fn refreshCursorBlinkOnUserInput(
     cursor_visible_blink.* = true;
     cursor_blink_active.* = true;
     last_input_ns.* = posix.nanoTimestamp();
+    armCursorBlinkTimer(evloop_fd, timer_fd, blink_timer_armed);
 }
 
 fn applyCursorBlinkTimerTick(
@@ -680,6 +737,8 @@ fn handleBackendEvent(
     backend: *Backend,
     write_queue: *PtyWriteQueue,
     evloop_fd: i32,
+    timer_fd: posix.fd_t,
+    blink_timer_armed: *bool,
     cursor_visible_blink: *bool,
     cursor_blink_active: *bool,
     last_input_ns: *i128,
@@ -689,7 +748,7 @@ fn handleBackendEvent(
 ) bool {
     switch (event.*) {
         .key => |key_ev| {
-            refreshCursorBlinkOnUserInput(cursor_visible_blink, cursor_blink_active, last_input_ns);
+            refreshCursorBlinkOnUserInput(evloop_fd, timer_fd, blink_timer_armed, cursor_visible_blink, cursor_blink_active, last_input_ns);
             if (!key_ev.pressed) return true;
 
             // Scrollback shortcuts — active on both main and alt screen
@@ -739,7 +798,7 @@ fn handleBackendEvent(
             }
         },
         .text => |text_ev| {
-            refreshCursorBlinkOnUserInput(cursor_visible_blink, cursor_blink_active, last_input_ns);
+            refreshCursorBlinkOnUserInput(evloop_fd, timer_fd, blink_timer_armed, cursor_visible_blink, cursor_blink_active, last_input_ns);
             if (config.scrollback_lines > 0 and term.view_offset > 0) {
                 term.scrollViewportToBottom();
             }
@@ -759,7 +818,7 @@ fn handleBackendEvent(
             term.setPreedit(text, preedit_ev.caret, fb, preedit_ev.active);
         },
         .paste => |paste_ev| {
-            refreshCursorBlinkOnUserInput(cursor_visible_blink, cursor_blink_active, last_input_ns);
+            refreshCursorBlinkOnUserInput(evloop_fd, timer_fd, blink_timer_armed, cursor_visible_blink, cursor_blink_active, last_input_ns);
             if (config.scrollback_lines > 0 and term.view_offset > 0) {
                 term.scrollViewportToBottom();
             }
@@ -827,6 +886,7 @@ fn handleBackendEvent(
             cursor_blink_active.* = true;
             last_input_ns.* = posix.nanoTimestamp();
             last_render_ns.* = 0;
+            armCursorBlinkTimer(evloop_fd, timer_fd, blink_timer_armed);
             term.markDirty(term.cursor_x, term.cursor_y);
             if (term.focus_events) {
                 if (!ptyBufferedWrite(pty_ptr, "\x1b[I", write_queue, evloop_fd)) {
@@ -838,6 +898,7 @@ fn handleBackendEvent(
             backend_focused.* = false;
             cursor_blink_active.* = false;
             cursor_visible_blink.* = true;
+            disarmCursorBlinkTimer(evloop_fd, timer_fd, blink_timer_armed);
             term.markDirty(term.cursor_x, term.cursor_y);
             if (term.focus_events) {
                 if (!ptyBufferedWrite(pty_ptr, "\x1b[O", write_queue, evloop_fd)) {
@@ -846,7 +907,7 @@ fn handleBackendEvent(
             }
         },
         .mouse => |mouse_ev| {
-            refreshCursorBlinkOnUserInput(cursor_visible_blink, cursor_blink_active, last_input_ns);
+            refreshCursorBlinkOnUserInput(evloop_fd, timer_fd, blink_timer_armed, cursor_visible_blink, cursor_blink_active, last_input_ns);
 
             // Pixel → cell coordinate conversion
             const col: u32 = mouse_ev.x / config.cell_width;
@@ -1158,6 +1219,8 @@ fn drainBackendEvents(
     backend: *Backend,
     write_queue: *PtyWriteQueue,
     evloop_fd: i32,
+    timer_fd: posix.fd_t,
+    blink_timer_armed: *bool,
     cursor_visible_blink: *bool,
     cursor_blink_active: *bool,
     last_input_ns: *i128,
@@ -1169,7 +1232,7 @@ fn drainBackendEvents(
     var drain: u32 = 0;
     while (drain < max_events) : (drain += 1) {
         const event = backend.pollEvents() orelse break;
-        if (!handleBackendEvent(&event, term, pty_ptr, backend, write_queue, evloop_fd, cursor_visible_blink, cursor_blink_active, last_input_ns, last_render_ns, backend_focused, last_pressed_button)) {
+        if (!handleBackendEvent(&event, term, pty_ptr, backend, write_queue, evloop_fd, timer_fd, blink_timer_armed, cursor_visible_blink, cursor_blink_active, last_input_ns, last_render_ns, backend_focused, last_pressed_button)) {
             return false;
         }
     }
@@ -1270,7 +1333,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer if (sig_fd >= 0) posix.close(sig_fd);
 
     // 8. Setup cursor blink timer (500ms)
-    const timer_fd = try createTimerFd(500_000_000);
+    const timer_fd = try createTimerFd(CURSOR_BLINK_NS);
     defer if (timer_fd >= 0) posix.close(timer_fd);
 
     // 9. Setup event loop (epoll on Linux, kqueue on macOS)
@@ -1342,9 +1405,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var parser = vt.Parser{};
     var running = true;
     var mod_state: input.Modifiers = .{};
-    var pty_buf: [config.pty_buf_size]u8 = undefined;
+    var pty_buf = try allocator.alloc(u8, config.pty_buf_size);
+    defer allocator.free(pty_buf);
     var cursor_visible_blink = true;
     var cursor_blink_active = true; // false after idle timeout — stops blink rendering
+    var blink_timer_armed = true; // cursor-blink timer starts armed (see createTimerFd); disarmed after idle timeout
     // false while unfocused: skip cursor timer toggles (avoids stale idle blink + extra wakeups)
     var backend_focused = true;
     var last_pressed_button: MouseButton = .none;
@@ -1399,7 +1464,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // fd is no longer readable. Drain a bounded amount every loop so input
             // never appears "stuck" waiting for unrelated socket traffic.
             if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos) {
-                if (!drainBackendEvents(&term, &pty, &backend, &write_queue, evloop_fd, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button, 8192)) {
+                if (!drainBackendEvents(&term, &pty, &backend, &write_queue, evloop_fd, timer_fd, &blink_timer_armed, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button, 8192)) {
                     running = false;
                     continue;
                 }
@@ -1430,7 +1495,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         // PTY readable — drain all available data before rendering
                         if (ev.events & linux.EPOLL.IN != 0) {
                             while (true) {
-                                const bytes_read = pty.read(&pty_buf) catch |err| switch (err) {
+                                const bytes_read = pty.read(pty_buf) catch |err| switch (err) {
                                     error.WouldBlock => break,
                                     else => {
                                         running = false;
@@ -1477,11 +1542,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
                             &cursor_visible_blink,
                             cursor_idle_timeout_ns,
                         );
+                        // Idle timeout reached: blink is frozen — stop the timer
+                        // so an idle terminal never wakes the process again.
+                        if (!cursor_blink_active) {
+                            disarmCursorBlinkTimer(evloop_fd, timer_fd, &blink_timer_armed);
+                        }
                     },
                     @intFromEnum(EpollTag.backend) => {
                         // Backend events (X11, Wayland or macOS)
                         if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos) {
-                            if (!drainBackendEvents(&term, &pty, &backend, &write_queue, evloop_fd, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button, 8192)) {
+                            if (!drainBackendEvents(&term, &pty, &backend, &write_queue, evloop_fd, timer_fd, &blink_timer_armed, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button, 8192)) {
                                 running = false;
                                 break;
                             }
@@ -1522,7 +1592,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                                 }
                             }
                             if (had_input) {
-                                refreshCursorBlinkOnUserInput(&cursor_visible_blink, &cursor_blink_active, &last_input_ns);
+                                refreshCursorBlinkOnUserInput(evloop_fd, timer_fd, &blink_timer_armed, &cursor_visible_blink, &cursor_blink_active, &last_input_ns);
                             }
                         }
                     },
@@ -1547,7 +1617,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     if (kev.udata == @intFromEnum(KqueueTag.pty)) {
                         // PTY readable — drain all available data
                         while (true) {
-                            const bytes_read = pty.read(&pty_buf) catch |err| switch (err) {
+                            const bytes_read = pty.read(pty_buf) catch |err| switch (err) {
                                 error.WouldBlock => break,
                                 else => {
                                     running = false;
@@ -1577,7 +1647,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         // Backend events (X11, Wayland or macOS)
                         if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos) {
                             while (backend.pollEvents()) |event| {
-                                if (!handleBackendEvent(&event, &term, &pty, &backend, &write_queue, evloop_fd, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button)) {
+                                if (!handleBackendEvent(&event, &term, &pty, &backend, &write_queue, evloop_fd, timer_fd, &blink_timer_armed, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button)) {
                                     running = false;
                                     break;
                                 }
@@ -1601,6 +1671,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         &cursor_visible_blink,
                         cursor_idle_timeout_ns,
                     );
+                    // Idle timeout reached: blink is frozen — stop the timer
+                    // so an idle terminal never wakes the process again.
+                    if (!cursor_blink_active) {
+                        disarmCursorBlinkTimer(evloop_fd, timer_fd, &blink_timer_armed);
+                    }
                 }
             }
 
@@ -1610,7 +1685,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // never appears because Cocoa callbacks never fire.
             if (config.backend == .macos) {
                 while (backend.pollEvents()) |event| {
-                    if (!handleBackendEvent(&event, &term, &pty, &backend, &write_queue, evloop_fd, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button)) {
+                    if (!handleBackendEvent(&event, &term, &pty, &backend, &write_queue, evloop_fd, timer_fd, &blink_timer_armed, &cursor_visible_blink, &cursor_blink_active, &last_input_ns, &last_render_ns, &backend_focused, &last_pressed_button)) {
                         running = false;
                         break;
                     }
@@ -1623,7 +1698,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (running) {
             var extra_total: usize = 0;
             while (extra_total < config.pty_buf_size) {
-                const extra = pty.read(&pty_buf) catch |err| switch (err) {
+                const extra = pty.read(pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
                     else => {
                         // EIO/HUP: child exited; terminate the event loop.

@@ -297,6 +297,8 @@ pub const ShmBuffer = struct {
     stride: u32,
     page_size: usize,
     pool_capacity: usize,
+    // wl_shm object id — needed to recreate the pool when shrinking.
+    shm_id: u32,
     current: u1 = 0,
     released: [2]bool = .{ true, true },
 
@@ -321,10 +323,10 @@ pub const ShmBuffer = struct {
         conn.sendMessage(self.pool_id, WL_SHM_POOL_DESTROY, &.{}, &.{}) catch {};
     }
 
-    /// Resize buffers in-place, reusing the existing SHM pool.
-    /// Only grows the pool (via wl_shm_pool.resize) — never shrinks.
-    /// This avoids pool ID churn and fd-based sendMessage (which forces
-    /// a mid-resize flush that can cause protocol ordering issues).
+    /// Resize buffers in-place, reusing the existing SHM pool when growing.
+    /// Growth uses wl_shm_pool.resize; a substantial shrink rebuilds the pool
+    /// (destroy + recreate at the smaller size) so the memfd releases memory
+    /// instead of retaining its high-water mark forever.
     pub fn resizeBuffers(self: *ShmBuffer, conn: *wire.Connection, width: u32, height: u32) !void {
         const new_stride = width * 4;
         const raw_size = @as(usize, new_stride) * @as(usize, height);
@@ -349,7 +351,7 @@ pub const ShmBuffer = struct {
             conn.sendMessage(buf_id, 0, &.{}, &.{}) catch {};
         }
 
-        // 2. Grow pool if needed
+        // 2. Grow the pool when the new size exceeds capacity.
         if (new_total_size > self.pool_capacity) {
             try posix.ftruncate(self.fd, @intCast(new_total_size));
             // mmap new region BEFORE munmap to avoid dangling pointer on failure
@@ -367,6 +369,37 @@ pub const ShmBuffer = struct {
             var pos: usize = 0;
             wire.putInt(&payload, &pos, @intCast(new_total_size));
             try conn.sendMessage(self.pool_id, WL_SHM_POOL_RESIZE, payload[0..pos], &.{});
+            self.pool_capacity = new_total_size;
+        } else if (new_total_size * 2 < self.pool_capacity) {
+            // Shrunk substantially (less than half the peak area): rebuild the
+            // pool so the memfd/mmap release memory instead of keeping the
+            // high-water mark forever. Hysteresis avoids pool churn on the
+            // small size fluctuations of a drag-resize. Buffers were already
+            // destroyed above; per the wl_shm spec, destroying the pool after
+            // destroying its buffers is safe even if the compositor still
+            // holds a release-pending attachment.
+            conn.sendMessage(self.pool_id, WL_SHM_POOL_DESTROY, &.{}, &.{}) catch {};
+
+            // Shrink the memfd and remap the pages.
+            try posix.ftruncate(self.fd, @intCast(new_total_size));
+            const new_data = try posix.mmap(
+                null,
+                new_total_size,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .SHARED },
+                self.fd,
+                0,
+            );
+            posix.munmap(self.data);
+            self.data = new_data;
+
+            // Create a fresh pool at the smaller size.
+            self.pool_id = conn.id_alloc.next();
+            var payload: [8]u8 = undefined;
+            var pos: usize = 0;
+            wire.putUint(&payload, &pos, self.pool_id);
+            wire.putInt(&payload, &pos, @intCast(new_total_size));
+            try conn.sendMessage(self.shm_id, WL_SHM_CREATE_POOL, payload[0..pos], &[_]posix.fd_t{self.fd});
             self.pool_capacity = new_total_size;
         }
 
@@ -485,6 +518,7 @@ pub fn createShmBuffers(
         .stride = stride,
         .page_size = page_size,
         .pool_capacity = total_size,
+        .shm_id = globals.shm,
     };
 }
 

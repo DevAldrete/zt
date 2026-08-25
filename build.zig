@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
 
     const scale_opt = b.option(u32, "scale", "Pixel scale factor: 1, 2, or 4 (default: 1)") orelse 1;
     const max_fps_opt = b.option(u32, "max_fps", "Maximum frame rate: 0 = unlimited (default: 120)") orelse 120;
-    const pty_buf_kb_opt = b.option(u32, "pty_buf_kb", "PTY read buffer size in KB (default: 1024)") orelse 1024;
+    const pty_buf_kb_opt = b.option(u32, "pty_buf_kb", "PTY read buffer size in KB (default: 256)") orelse 256;
     if (pty_buf_kb_opt == 0) {
         @panic("invalid -Dpty_buf_kb=0; expected a positive buffer size");
     }
@@ -92,7 +92,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const strip_opt = b.option(bool, "strip", "Strip debug info and symbols (default: false)") orelse false;
+    // Strip debug info/symbols by default for release builds (binary drops to
+    // ~3MB); Debug keeps symbols for debugging. Pass -Dstrip=false to opt out.
+    const strip_opt = b.option(bool, "strip", "Strip debug info and symbols (default: true for Release, false for Debug)") orelse (optimize != .Debug);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
