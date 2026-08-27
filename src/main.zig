@@ -1378,6 +1378,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     //     that event-based detection might miss due to buffering.
     if (config.backend == .x11 or config.backend == .wayland or config.backend == .macos) {
         const actual = backend.queryGeometry();
+        std.debug.print("DBG actual={d}x{d} backend={d}x{d}\n", .{ actual.w, actual.h, backend.getWidth(), backend.getHeight() });
         if (actual.w > 0 and actual.h > 0 and (actual.w != backend.getWidth() or actual.h != backend.getHeight())) {
             const new_cols = actual.w / config.cell_width;
             const new_rows = actual.h / config.cell_height;

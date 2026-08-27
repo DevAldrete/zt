@@ -695,6 +695,26 @@ fn registerZTViewClass() ?id {
 fn ztDrawRect(self_view: id, _: SEL, _: CGRect) callconv(.c) void {
     const backend = MacosBackend.getBackendFromView(self_view) orelse return;
 
+    // TEMP DIAGNOSTIC — remove after measuring
+    {
+        const S = struct {
+            var count: u32 = 0;
+        };
+        if (S.count < 5) {
+            S.count += 1;
+            const bounds = msgSend_CGRect(self_view, sel("bounds"));
+            const window = msgSend_id(self_view, sel("window"));
+            const wframe = msgSend_CGRect(window, sel("frame"));
+            const getScale: *const fn (id, SEL) callconv(.c) CGFloat = @ptrCast(&objc_msgSend);
+            const scale = getScale(window, sel("backingScaleFactor"));
+            std.debug.print("DIAG draw#{d}: view_bounds={d:.0}x{d:.0} win_frame={d:.0},{d:.0} {d:.0}x{d:.0} scale={d:.1} buf={d}x{d}\n", .{
+                S.count, bounds.size.width, bounds.size.height,
+                wframe.origin.x, wframe.origin.y, wframe.size.width, wframe.size.height,
+                scale, backend.width, backend.height,
+            });
+        }
+    }
+
     // Create CGImage from bitmap context
     const image = CGBitmapContextCreateImage(backend.cg_context) orelse return;
     defer CGImageRelease(image);
